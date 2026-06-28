@@ -46,7 +46,7 @@ from matplotlib.backends.backend_qt5agg import (
 from PyQt5.QtCore import (
     Qt, QAbstractTableModel, QModelIndex, QEvent, QObject, QTimer, pyqtSignal,
 )
-from PyQt5.QtGui import QKeySequence, QBrush, QColor
+from PyQt5.QtGui import QKeySequence, QBrush, QColor, QIcon
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QSplitter, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTableView, QTreeWidget,
@@ -70,6 +70,31 @@ def resource_path(*parts) -> str:
     PyInstaller (which unpacks bundled data under sys._MEIPASS)."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base, *parts)
+
+
+def find_app_icon() -> str:
+    """Locate the application icon for the window/taskbar (NOT the same thing as
+    the .exe's embedded icon or the .graf document icon). Searches the frozen
+    bundle, the script dir, and its parent (so dev runs from src/ still work).
+    Prefers .ico on Windows for crisp multi-resolution rendering."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    bases = []
+    mp = getattr(sys, "_MEIPASS", None)
+    if mp:
+        bases.append(mp)
+    bases.extend([here, os.path.dirname(here)])
+    names = [("icons", "app", "graf_app.ico"), ("icons", "app", "graf_app.png")]
+    for base in bases:
+        for rel in names:
+            p = os.path.join(base, *rel)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def application_icon() -> QIcon:
+    p = find_app_icon()
+    return QIcon(p) if p else QIcon()
 
 
 def custom_icon_qss() -> str:
@@ -1070,6 +1095,7 @@ class GrafExplorer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GrAF Explorer")
+        self.setWindowIcon(application_icon())
         self.resize(1320, 840)
         self.setAcceptDrops(True)
 
@@ -1301,8 +1327,19 @@ class DropForwarder(QObject):
 
 
 def main():
+    # On Windows, give the process its own taskbar identity so the taskbar uses
+    # our window icon instead of grouping the app under the Python launcher.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com.grantgiesbrecht.grafexplorer")
+        except Exception:
+            pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("GrAF Explorer")
+    app.setWindowIcon(application_icon())     # title bar + taskbar icon
     app.setStyle(QStyleFactory.create("Fusion"))
 
     win = GrafExplorer()
