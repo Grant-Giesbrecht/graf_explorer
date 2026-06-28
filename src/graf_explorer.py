@@ -27,7 +27,10 @@ Requirements:
 
 import os
 import sys
+import csv
+import json
 import copy
+import pickle
 import tempfile
 import traceback
 from pathlib import Path
@@ -435,6 +438,39 @@ def enumerate_data_items(packet):
     return items
 
 
+def _to_number_list(v):
+    """Coerce a data array (list / tuple / ndarray) into a flat list of plain
+    Python numbers, unwrapping any numpy scalar types."""
+    if v is None:
+        return []
+    if isinstance(v, np.ndarray):
+        v = v.tolist()
+    elif isinstance(v, tuple):
+        v = list(v)
+    elif not isinstance(v, list):
+        try:
+            v = list(v)
+        except TypeError:
+            return []
+    return [_unwrap_scalar(e) for e in v]
+
+
+def collect_trace_data(packet):
+    """Trace data only (no surfaces), labelled by axis / trace / display name."""
+    out = []
+    for ax_key, ax in (packet.get("axes", {}) or {}).items():
+        for tr_key, tr in (ax.get("traces", {}) or {}).items():
+            out.append({
+                "axis": ax_key,
+                "trace": tr_key,
+                "name": tr.get("display_name", "") or "",
+                "x": _to_number_list(tr.get("x_data", [])),
+                "y": _to_number_list(tr.get("y_data", [])),
+                "z": _to_number_list(tr.get("z_data", [])),
+            })
+    return out
+
+
 # ── Editable trace-data table model ─────────────────────────────────────────────
 class TraceTableModel(QAbstractTableModel):
     """Edits operate on the actual packet lists, so changes propagate to render
@@ -571,13 +607,15 @@ class FileTab(QWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.addWidget(self._build_lockbar())
 
-        split = QSplitter(Qt.Horizontal)
-        split.addWidget(self._build_plot_panel())
-        split.addWidget(self._build_sidebar())
-        split.setStretchFactor(0, 3)
-        split.setStretchFactor(1, 2)
-        split.setSizes([760, 480])
-        outer.addWidget(split, 1)        # the splitter takes all extra vertical space
+        self.hsplit = QSplitter(Qt.Horizontal)
+        self.hsplit.addWidget(self._build_plot_panel())
+        self.sidebar = self._build_sidebar()
+        self.hsplit.addWidget(self.sidebar)
+        self.hsplit.setStretchFactor(0, 3)
+        self.hsplit.setStretchFactor(1, 2)
+        self.hsplit.setSizes([760, 480])
+        self._saved_split_sizes = None
+        outer.addWidget(self.hsplit, 1)  # the splitter takes all extra vertical space
 
         # First render from the known-good loaded object.
         try:
@@ -939,6 +977,17 @@ class FileTab(QWidget):
     def toggle_lock(self):
         self.set_locked(not self.locked)
 
+    def set_sidebar_visible(self, visible):
+        """Show/hide the structure + trace-data sidebar, preserving the split."""
+        if visible:
+            self.sidebar.setVisible(True)
+            if self._saved_split_sizes:
+                self.hsplit.setSizes(self._saved_split_sizes)
+        else:
+            if self.sidebar.isVisible():
+                self._saved_split_sizes = self.hsplit.sizes()
+            self.sidebar.setVisible(False)
+
     def _sync_edit_state(self):
         locked = self.locked
         editable_table = (not locked) and self._current_is_trace
@@ -1081,6 +1130,104 @@ class FileTab(QWidget):
         self.modifiedChanged.emit()
         return True
 
+    # -- exports ---------------------------------------------------------------
+    _FIG_FORMATS = {
+        "png":    ("png",  "PNG image (*.png)"),
+        "jpeg":   ("jpg",  "JPEG image (*.jpg *.jpeg)"),
+        "svg":    ("svg",  "SVG vector (*.svg)"),
+        "pdf":    ("pdf",  "PDF document (*.pdf)"),
+        "pklfig": ("pklfig", "Pickled Matplotlib figure (*.pklfig)"),
+    }
+    _DATA_FORMATS = {
+        "csv":  ("csv",  "CSV (*.csv)"),
+        "json": ("json", "JSON (*.json)"),
+    }
+
+    @staticmethod
+    def _ensure_ext(path, ext):
+        return path if path.lower().endswith("." + ext.lower()) else path + "." + ext
+
+    def export_figure(self, fmt):
+        if self.fig is None:
+            self.struct_status.setText("Nothing to export")
+            return
+        ext, filt = self._FIG_FORMATS[fmt]
+        default = str(self.path.with_suffix("." + ext))
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export figure as {fmt.upper()}", default, filt)
+        if not path:
+            return
+        path = self._ensure_ext(path, ext)
+        try:
+            if fmt == "pklfig":
+                with open(path, "wb") as fh:
+                    pickle.dump(self.fig, fh)
+            else:
+                save_kwargs = {"facecolor": self.fig.get_facecolor()}
+                if fmt in ("png", "jpeg"):
+                    save_kwargs["dpi"] = 200
+                self.fig.savefig(path, format=fmt, **save_kwargs)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed",
+                                 f"Could not export the figure:\n\n{exc}")
+            return
+        self.struct_status.setText(f"Exported figure → {os.path.basename(path)}")
+
+    def export_data(self, fmt):
+        data = collect_trace_data(self.packet)
+        if not data:
+            self.struct_status.setText("No trace data to export")
+            return
+        ext, filt = self._DATA_FORMATS[fmt]
+        default = str(self.path.with_suffix("." + ext))
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export data as {fmt.upper()}", default, filt)
+        if not path:
+            return
+        path = self._ensure_ext(path, ext)
+        try:
+            if fmt == "csv":
+                self._write_csv(path, data)
+            else:
+                self._write_json(path, data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed",
+                                 f"Could not export the data:\n\n{exc}")
+            return
+        self.struct_status.setText(
+            f"Exported {len(data)} trace(s) → {os.path.basename(path)}")
+
+    def _write_csv(self, path, data):
+        # Wide layout: each trace contributes X / Y (and Z if present) columns,
+        # headed by its name and axis/trace id. Unequal lengths are blank-filled.
+        columns = []   # list of (header, values)
+        for d in data:
+            tag = d["name"] or d["trace"]
+            base = f"{tag} [{d['axis']}/{d['trace']}]"
+            columns.append((f"{base} X", d["x"]))
+            columns.append((f"{base} Y", d["y"]))
+            if d["z"]:
+                columns.append((f"{base} Z", d["z"]))
+        nrows = max((len(v) for _, v in columns), default=0)
+        with open(path, "w", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            w.writerow([h for h, _ in columns])
+            for i in range(nrows):
+                w.writerow([(v[i] if i < len(v) else "") for _, v in columns])
+
+    def _write_json(self, path, data):
+        payload = {"source_file": self.path.name,
+                   "exported_by": "GrAF Explorer",
+                   "traces": []}
+        for d in data:
+            entry = {"axis": d["axis"], "trace": d["trace"], "name": d["name"],
+                     "x": d["x"], "y": d["y"]}
+            if d["z"]:
+                entry["z"] = d["z"]
+            payload["traces"].append(entry)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=float)
+
     def close_figure(self):
         if self.fig is not None:
             try:
@@ -1112,6 +1259,7 @@ class GrafExplorer(QMainWindow):
         self.stack.addWidget(self.tabs)
 
         self.theme = replace(THEMES[DEFAULT_THEME])
+        self._sidebar_visible = True
         self._build_menu()
         self._apply_theme()
         self._sync_view()
@@ -1147,6 +1295,18 @@ class GrafExplorer(QMainWindow):
         act_close.triggered.connect(self._close_current_tab)
 
         filemenu.addSeparator()
+        export_fig = filemenu.addMenu("Export to")
+        for label, key in [("PNG", "png"), ("JPEG", "jpeg"), ("SVG", "svg"),
+                           ("PDF", "pdf"), ("Pickled figure (.pklfig)", "pklfig")]:
+            a = export_fig.addAction(label)
+            a.triggered.connect(lambda _c, k=key: self._export_fig_current(k))
+
+        export_data = filemenu.addMenu("Export data")
+        for label, key in [("CSV", "csv"), ("JSON", "json")]:
+            a = export_data.addAction(label)
+            a.triggered.connect(lambda _c, k=key: self._export_data_current(k))
+
+        filemenu.addSeparator()
         act_quit = filemenu.addAction("Quit")
         act_quit.setShortcut(QKeySequence.Quit)
         act_quit.triggered.connect(self.close)
@@ -1163,6 +1323,14 @@ class GrafExplorer(QMainWindow):
         act_revert.triggered.connect(self._revert_current)
 
         viewmenu = bar.addMenu("View")
+
+        self._sidebar_action = viewmenu.addAction("Show Sidebar")
+        self._sidebar_action.setCheckable(True)
+        self._sidebar_action.setChecked(self._sidebar_visible)
+        self._sidebar_action.setShortcut("Ctrl+B")     # Cmd+B on macOS
+        self._sidebar_action.toggled.connect(self._toggle_sidebar)
+        viewmenu.addSeparator()
+
         theme_menu = viewmenu.addMenu("Theme")
         self._theme_group = QActionGroup(self); self._theme_group.setExclusive(True)
         for tname in THEMES:
@@ -1232,6 +1400,7 @@ class GrafExplorer(QMainWindow):
         self.tabs.setTabToolTip(idx, str(path.resolve()))
         self.tabs.setCurrentIndex(idx)
         tab.modifiedChanged.connect(lambda t=tab: self._refresh_tab_text(t))
+        tab.set_sidebar_visible(self._sidebar_visible)
         self._sync_view()
 
     def _save_current(self):
@@ -1257,6 +1426,23 @@ class GrafExplorer(QMainWindow):
         t = self._current_tab()
         if t:
             t.revert()
+
+    def _export_fig_current(self, fmt):
+        t = self._current_tab()
+        if t:
+            t.export_figure(fmt)
+
+    def _export_data_current(self, fmt):
+        t = self._current_tab()
+        if t:
+            t.export_data(fmt)
+
+    def _toggle_sidebar(self, visible):
+        self._sidebar_visible = visible
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_sidebar_visible(visible)
 
     def _refresh_tab_text(self, tab):
         idx = self.tabs.indexOf(tab)
