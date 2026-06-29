@@ -444,13 +444,15 @@ def enumerate_data_items(packet):
     items = []
     for ax_key, ax in (packet.get("axes", {}) or {}).items():
         for tr_key, tr in (ax.get("traces", {}) or {}).items():
-            name = tr.get("display_name", "") or "(unnamed)"
-            items.append({"label": f"{ax_key} · {tr_key}   {name}",
-                          "kind": "trace", "node": tr})
+            name = tr.get("display_name", "") or ""
+            items.append({"label": f"{ax_key} · {tr_key}   {name or '(unnamed)'}",
+                          "kind": "trace", "node": tr,
+                          "axis": ax_key, "trace": tr_key, "name": name})
         for sf_key, sf in (ax.get("surfaces", {}) or {}).items():
-            name = sf.get("display_name", "") or "(unnamed)"
-            items.append({"label": f"{ax_key} · {sf_key}   {name}   [surface]",
-                          "kind": "surface", "node": sf})
+            name = sf.get("display_name", "") or ""
+            items.append({"label": f"{ax_key} · {sf_key}   {name or '(unnamed)'}   [surface]",
+                          "kind": "surface", "node": sf,
+                          "axis": ax_key, "trace": sf_key, "name": name})
     return items
 
 
@@ -527,7 +529,7 @@ def _fft_window(name, n):
             }.get(key, np.hanning)(n)
 
 
-def compute_fft(x, y, window="Hann", db=True, xmin=None, xmax=None):
+def compute_fft(x, y, window="Hann", db=True, xmin=None, xmax=None, resample=False):
     """One-sided amplitude spectrum of y. Returns (freq, mag, info, xunit_known)."""
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -545,6 +547,13 @@ def compute_fft(x, y, window="Hann", db=True, xmin=None, xmax=None):
     if n < 4:
         raise ValueError("need at least 4 points in the selected range")
 
+    resampled = False
+    if resample:
+        xu = np.linspace(x[0], x[-1], n)        # uniform grid over the same span
+        y = np.interp(xu, x, y)
+        x = xu
+        resampled = True
+
     diffs = np.diff(x)
     uniform = diffs.size > 0 and np.allclose(diffs, diffs[0], rtol=1e-3, atol=0) \
         and diffs[0] > 0
@@ -558,9 +567,11 @@ def compute_fft(x, y, window="Hann", db=True, xmin=None, xmax=None):
     if db:
         mag = 20.0 * np.log10(np.maximum(mag, 1e-300))
     info = f"{n} pts · {window} · {'dB' if db else 'linear'}"
-    if not uniform:
+    if resampled:
+        info += " · resampled to uniform"
+    elif not uniform:
         info += " · non-uniform X (Δx averaged)"
-    return freq, mag, info, uniform
+    return freq, mag, info, (uniform or resampled)
 
 
 # Curve-fit models: name -> (function(x, *p), param_names, guess(x, y)).
@@ -775,7 +786,7 @@ class FileTab(QWidget):
         self._undo_limit = 50
 
         # analysis / render state
-        self._render_mode = "normal"      # "normal" | "fft"
+        self._fft_on = False              # show FFT axes below the main graph
         self._fit_result = None           # dict(ax_key,x,y,label) or None
         self._cursor = None
         self.cursors_enabled = True
@@ -894,7 +905,10 @@ class FileTab(QWidget):
         self.fit_btn.clicked.connect(self._do_fit)
         self.fit_clear_btn = QPushButton("Clear"); self.fit_clear_btn.setObjectName("miniButton")
         self.fit_clear_btn.clicked.connect(self._clear_fit)
-        fbtns.addWidget(self.fit_btn); fbtns.addWidget(self.fit_clear_btn); fbtns.addStretch(1)
+        fbtns.addWidget(self.fit_btn); fbtns.addWidget(self.fit_clear_btn)
+        self.fit_show = QCheckBox("Show fit"); self.fit_show.setChecked(True)
+        self.fit_show.toggled.connect(self._on_fit_show_toggled)
+        fbtns.addWidget(self.fit_show); fbtns.addStretch(1)
         v.addLayout(fbtns)
         self.fit_result_label = QLabel(""); self.fit_result_label.setObjectName("welcomeHint")
         self.fit_result_label.setWordWrap(True)
@@ -903,7 +917,7 @@ class FileTab(QWidget):
         # FFT
         ft = QLabel("FFT"); ft.setObjectName("sectionHeader")
         v.addWidget(ft)
-        self.fft_check = QCheckBox("Show FFT of this trace")
+        self.fft_check = QCheckBox("Show FFT below the graph")
         self.fft_check.toggled.connect(self._on_fft_toggle)
         v.addWidget(self.fft_check)
         fftform = QFormLayout(); fftform.setContentsMargins(0, 0, 0, 0)
@@ -914,6 +928,9 @@ class FileTab(QWidget):
         self.fft_db = QCheckBox("magnitude in dB"); self.fft_db.setChecked(True)
         self.fft_db.toggled.connect(self._on_fft_param_changed)
         fftform.addRow("", self.fft_db)
+        self.fft_resample = QCheckBox("uniform resample")
+        self.fft_resample.toggled.connect(self._on_fft_param_changed)
+        fftform.addRow("", self.fft_resample)
         self.fft_from = QLineEdit(); self.fft_from.setValidator(QDoubleValidator())
         self.fft_from.setPlaceholderText("min")
         self.fft_from.editingFinished.connect(self._on_fft_param_changed)
@@ -990,7 +1007,7 @@ class FileTab(QWidget):
         self._clear_fit(rerender=False)
         self._reset_fft_range(rerender=False)
         self._update_stats()
-        if self._render_mode == "fft":
+        if self._fft_on:
             self._show_current()
 
     # -- curve fit -------------------------------------------------------------
@@ -1011,17 +1028,22 @@ class FileTab(QWidget):
         except Exception as exc:
             self.fit_result_label.setText(f"Fit failed: {exc}")
             return
-        self._fit_result = {"ax_key": item["axis"], "x": xfit, "y": yfit, "label": label}
+        self._fit_result = {"ax_key": item.get("axis"), "x": xfit, "y": yfit, "label": label}
         txt = "  ".join(f"{n}={v:.5g}" for n, v in params)
         self.fit_result_label.setText(f"{label}:  {txt}\nR² = {r2:.5f}")
-        if self._render_mode == "normal":
-            self._show_current()
+        self.fit_show.blockSignals(True)
+        self.fit_show.setChecked(True)          # a fresh fit is shown by default
+        self.fit_show.blockSignals(False)
+        self._show_current()
+
+    def _on_fit_show_toggled(self, _on):
+        self._show_current()
 
     def _clear_fit(self, rerender=True):
         had = self._fit_result is not None
         self._fit_result = None
         self.fit_result_label.setText("")
-        if had and rerender and self._render_mode == "normal":
+        if had and rerender:
             self._show_current()
 
     # -- FFT -------------------------------------------------------------------
@@ -1035,19 +1057,18 @@ class FileTab(QWidget):
         return parse(self.fft_from), parse(self.fft_to)
 
     def _on_fft_toggle(self, on):
-        self._render_mode = "fft" if on else "normal"
+        self._fft_on = on
         self._show_current()
 
     def _on_fft_param_changed(self, *_):
-        if self._render_mode == "fft":
+        if self._fft_on:
             self._show_current()
 
     def _reset_fft_range(self, rerender=True):
-        item = self._current_analysis_trace()
         self.fft_from.blockSignals(True); self.fft_to.blockSignals(True)
         self.fft_from.clear(); self.fft_to.clear()
         self.fft_from.blockSignals(False); self.fft_to.blockSignals(False)
-        if rerender and self._render_mode == "fft":
+        if rerender and self._fft_on:
             self._show_current()
 
     # -- right: structure + trace data ----------------------------------------
@@ -1500,28 +1521,31 @@ class FileTab(QWidget):
         return ok, err
 
     def _show_current(self, graf=None):
-        """Build and display the figure for the current mode, with the fit
-        overlay and data cursors applied. Returns (ok, err); on failure the
-        previous figure is left in place."""
+        """Render the main graph (with fit overlay), optionally adding an FFT
+        axes below it. Returns (ok, err); on a base-render failure the previous
+        figure is left in place. An FFT failure still shows the main graph and
+        reports the reason on the FFT status line."""
         g = graf if graf is not None else self.graf
         try:
-            if self._render_mode == "fft":
-                fig = self._build_fft_figure()
-            else:
-                fig = g.to_fig(window_title=self._make_title())
-                self._apply_fit_overlay(fig)
+            fig = g.to_fig(window_title=self._make_title())
         except Exception as exc:
             return False, exc
+        self._apply_fit_overlay(fig)
+        if self._fft_on:
+            try:
+                self._augment_with_fft(fig)
+            except Exception as exc:
+                self.fft_status.setText(f"FFT error: {exc}")
         self._set_figure(fig)
         self._attach_cursors(fig)
         return True, None
 
     def _apply_fit_overlay(self, fig):
-        if not self._fit_result:
+        if not self._fit_result or not self.fit_show.isChecked():
             return
         try:
             ax_keys = list(self.packet.get("axes", {}).keys())
-            key = self._fit_result["ax_key"]
+            key = self._fit_result.get("ax_key")
             idx = ax_keys.index(key) if key in ax_keys else 0
             if idx < len(fig.axes):
                 ax = fig.axes[idx]
@@ -1532,35 +1556,59 @@ class FileTab(QWidget):
         except Exception:
             pass
 
-    def _build_fft_figure(self):
+    def _augment_with_fft(self, fig):
+        """Compress the existing (main) axes into the top band of the figure and
+        add an FFT axes in the bottom band, horizontally aligned with the main."""
         item = self._current_analysis_trace()
         if item is None:
             raise ValueError("no trace selected for FFT")
         node = item["node"]
-        x = self._as_list(node, "x_data")
-        y = self._as_list(node, "y_data")
-        xmin, xmax = self._fft_range()
         freq, mag, info, uniform = compute_fft(
-            x, y, window=self.fft_window.currentText(),
-            db=self.fft_db.isChecked(), xmin=xmin, xmax=xmax)
+            self._as_list(node, "x_data"), self._as_list(node, "y_data"),
+            window=self.fft_window.currentText(), db=self.fft_db.isChecked(),
+            xmin=self._fft_range()[0], xmax=self._fft_range()[1],
+            resample=self.fft_resample.isChecked())
         self.fft_status.setText(info)
+
         try:
-            w_in = self.graf.fig_width_cm / 2.54
-            h_in = self.graf.fig_height_cm / 2.54
+            fig.set_constrained_layout(False)   # stop auto-layout from undoing us
         except Exception:
-            w_in, h_in = 6.4, 4.8
-        fig = plt.figure(self._make_title(), figsize=(w_in, h_in))
-        ax = fig.add_subplot(111)
-        ax.plot(freq, mag, color="#4b89dc", linewidth=1.2)
-        ax.set_xlabel("Frequency" + ("" if uniform else " (per sample)"))
-        ax.set_ylabel("Magnitude (dB)" if self.fft_db.isChecked() else "Magnitude")
-        ax.set_title(f"FFT — {item['name'] or item['trace']}")
-        ax.grid(True, alpha=0.3)
-        fig.tight_layout()
-        return fig
+            pass
+
+        # horizontal extent to match the (first) main axes
+        if fig.axes:
+            p0 = fig.axes[0].get_position()
+            main_x0, main_w = p0.x0, p0.width
+        else:
+            main_x0, main_w = 0.125, 0.78
+
+        y_split = 0.40                          # main occupies [y_split, 1]
+        for ax in fig.axes:
+            pos = ax.get_position()
+            ax.set_position([pos.x0,
+                             y_split + pos.y0 * (1.0 - y_split),
+                             pos.width,
+                             pos.height * (1.0 - y_split)])
+
+        fft_ax = fig.add_axes([main_x0, 0.07, main_w, 0.21])
+        fft_ax.plot(freq, mag, color="#4b89dc", linewidth=1.2)
+        fft_ax.set_xlabel("Frequency" + ("" if uniform else " (per sample)"),
+                          fontsize="small")
+        fft_ax.set_ylabel("Mag (dB)" if self.fft_db.isChecked() else "Mag",
+                          fontsize="small")
+        fft_ax.set_title(f"FFT — {item['name'] or item['trace']}", fontsize="small")
+        fft_ax.tick_params(labelsize="small")
+        fft_ax.grid(True, alpha=0.3)
 
     def _attach_cursors(self, fig):
-        self._cursor = None
+        # Always tear down the previous cursor first — otherwise disabling does
+        # nothing (the old mplcursors stays connected to the canvas).
+        if self._cursor is not None:
+            try:
+                self._cursor.remove()
+            except Exception:
+                pass
+            self._cursor = None
         if mplcursors is None or not self.cursors_enabled:
             return
         try:
@@ -1569,7 +1617,9 @@ class FileTab(QWidget):
                 lines.extend(ax.get_lines())
             if not lines:
                 return
-            self._cursor = mplcursors.cursor(lines, hover=False)
+            # multiple=True → each click leaves a persistent datatip
+            # (right-click a datatip to remove it).
+            self._cursor = mplcursors.cursor(lines, hover=False, multiple=True)
 
             @self._cursor.connect("add")
             def _on_add(sel):
