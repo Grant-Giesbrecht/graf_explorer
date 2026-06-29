@@ -47,15 +47,31 @@ from matplotlib.backends.backend_qt5agg import (
 )
 
 from PyQt5.QtCore import (
-    Qt, QAbstractTableModel, QModelIndex, QEvent, QObject, QTimer, pyqtSignal,
+    Qt, QAbstractTableModel, QModelIndex, QEvent, QObject, QTimer, QSettings,
+    pyqtSignal,
 )
-from PyQt5.QtGui import QKeySequence, QBrush, QColor, QIcon
+from PyQt5.QtGui import QKeySequence, QBrush, QColor, QIcon, QDoubleValidator
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QSplitter, QStackedWidget,
     QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTableView, QTreeWidget,
     QTreeWidgetItem, QFileDialog, QMessageBox, QStyleFactory, QHeaderView,
     QPushButton, QAbstractItemView, QActionGroup, QCheckBox, QSizePolicy,
+    QLineEdit, QSpinBox, QGridLayout, QFormLayout,
 )
+
+# Optional analysis dependencies — the app still runs without them, the relevant
+# UI just reports that they're missing.
+try:
+    import mplcursors
+except Exception:
+    mplcursors = None
+
+try:
+    from scipy.optimize import curve_fit as _scipy_curve_fit
+    from scipy.signal import windows as _scipy_windows
+except Exception:
+    _scipy_curve_fit = None
+    _scipy_windows = None
 
 # ── GrAF stack ────────────────────────────────────────────────────────────────
 from graf.base import Graf
@@ -471,6 +487,165 @@ def collect_trace_data(packet):
     return out
 
 
+# ── Analysis helpers (stats / FFT / curve fitting) ──────────────────────────────
+def trace_statistics(y):
+    a = np.asarray(y, dtype=float)
+    a = a[np.isfinite(a)]
+    if a.size == 0:
+        return None
+    return [
+        ("N", f"{a.size}"),
+        ("min", FLOAT_FMT % a.min()),
+        ("max", FLOAT_FMT % a.max()),
+        ("peak-peak", FLOAT_FMT % np.ptp(a)),
+        ("mean", FLOAT_FMT % a.mean()),
+        ("median", FLOAT_FMT % np.median(a)),
+        ("RMS", FLOAT_FMT % np.sqrt(np.mean(a ** 2))),
+        ("std (n-1)", FLOAT_FMT % (a.std(ddof=1) if a.size > 1 else 0.0)),
+    ]
+
+
+FFT_WINDOWS = ["Rectangular", "Hann", "Hamming", "Blackman", "Bartlett",
+               "Flattop", "Blackman-Harris"]
+
+
+def _fft_window(name, n):
+    """Return an n-point window. Uses scipy.signal.windows when available for the
+    richer set, else falls back to numpy for the common ones."""
+    key = name.lower()
+    if key in ("rectangular", "rect", "none", "boxcar"):
+        return np.ones(n)
+    if _scipy_windows is not None:
+        mapping = {"hann": "hann", "hamming": "hamming", "blackman": "blackman",
+                   "bartlett": "bartlett", "flattop": "flattop",
+                   "blackman-harris": "blackmanharris"}
+        return _scipy_windows.get_window(mapping.get(key, "hann"), n, fftbins=True)
+    # numpy fallback (Flattop / Blackman-Harris unavailable → Blackman)
+    return {"hann": np.hanning, "hamming": np.hamming,
+            "blackman": np.blackman, "bartlett": np.bartlett,
+            "flattop": np.blackman, "blackman-harris": np.blackman
+            }.get(key, np.hanning)(n)
+
+
+def compute_fft(x, y, window="Hann", db=True, xmin=None, xmax=None):
+    """One-sided amplitude spectrum of y. Returns (freq, mag, info, xunit_known)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    if xmin is not None:
+        sel = x >= xmin
+        x, y = x[sel], y[sel]
+    if xmax is not None:
+        sel = x <= xmax
+        x, y = x[sel], y[sel]
+    n = y.size
+    if n < 4:
+        raise ValueError("need at least 4 points in the selected range")
+
+    diffs = np.diff(x)
+    uniform = diffs.size > 0 and np.allclose(diffs, diffs[0], rtol=1e-3, atol=0) \
+        and diffs[0] > 0
+    dt = float(np.mean(diffs)) if diffs.size and np.mean(diffs) > 0 else 1.0
+
+    w = _fft_window(window, n)
+    yw = (y - y.mean()) * w
+    spec = np.fft.rfft(yw)
+    freq = np.fft.rfftfreq(n, d=dt)
+    mag = np.abs(spec) * 2.0 / np.sum(w)        # amplitude-correct normalization
+    if db:
+        mag = 20.0 * np.log10(np.maximum(mag, 1e-300))
+    info = f"{n} pts · {window} · {'dB' if db else 'linear'}"
+    if not uniform:
+        info += " · non-uniform X (Δx averaged)"
+    return freq, mag, info, uniform
+
+
+# Curve-fit models: name -> (function(x, *p), param_names, guess(x, y)).
+def _g_linear(x, y):
+    return (1.0, 0.0)
+
+
+def _g_exp(x, y):
+    span = max(x.max() - x.min(), 1e-9)
+    return (y.max() - y.min() or 1.0, 1.0 / span, y.min())
+
+
+def _g_gauss(x, y):
+    amp = y.max() - y.min() or 1.0
+    mu = x[np.argmax(y)]
+    sigma = max((x.max() - x.min()) / 6.0, 1e-9)
+    return (amp, mu, sigma, y.min())
+
+
+def _g_lorentz(x, y):
+    amp = y.max() - y.min() or 1.0
+    x0 = x[np.argmax(y)]
+    gamma = max((x.max() - x.min()) / 6.0, 1e-9)
+    return (amp, x0, gamma, y.min())
+
+
+def _g_power(x, y):
+    return (1.0, 1.0)
+
+
+def _g_sine(x, y):
+    amp = (y.max() - y.min()) / 2.0 or 1.0
+    span = max(x.max() - x.min(), 1e-9)
+    return (amp, 1.0 / span, 0.0, y.mean())
+
+
+FIT_MODELS = {
+    "Linear":      (lambda x, a, b: a * x + b, ["a", "b"], _g_linear),
+    "Exponential": (lambda x, a, b, c: a * np.exp(b * x) + c, ["a", "b", "c"], _g_exp),
+    "Gaussian":    (lambda x, a, mu, sig, c: a * np.exp(-(x - mu) ** 2 / (2 * sig ** 2)) + c,
+                    ["a", "mu", "sigma", "c"], _g_gauss),
+    "Lorentzian":  (lambda x, a, x0, g, c: a * g ** 2 / ((x - x0) ** 2 + g ** 2) + c,
+                    ["a", "x0", "gamma", "c"], _g_lorentz),
+    "Power law":   (lambda x, a, b: a * np.power(x, b), ["a", "b"], _g_power),
+    "Sine":        (lambda x, a, f, phi, c: a * np.sin(2 * np.pi * f * x + phi) + c,
+                    ["a", "f", "phi", "c"], _g_sine),
+}
+# "Polynomial" is handled separately (np.polyfit with a chosen degree).
+
+
+def fit_trace(x, y, model, degree=2):
+    """Fit and return (params:list[(name,val)], r2, xfit, yfit, label)."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if x.size < 2:
+        raise ValueError("not enough finite points to fit")
+    order = np.argsort(x)
+    x, y = x[order], y[order]
+    xfit = np.linspace(x.min(), x.max(), max(200, x.size))
+
+    if model == "Polynomial":
+        coeffs = np.polyfit(x, y, int(degree))
+        yhat = np.polyval(coeffs, x)
+        yfit = np.polyval(coeffs, xfit)
+        params = [(f"c{int(degree) - i}", c) for i, c in enumerate(coeffs)]
+        label = f"poly deg {int(degree)}"
+    else:
+        if _scipy_curve_fit is None:
+            raise RuntimeError("curve fitting needs scipy (pip install scipy)")
+        func, names, guess = FIT_MODELS[model]
+        p0 = guess(x, y)
+        popt, _ = _scipy_curve_fit(func, x, y, p0=p0, maxfev=10000)
+        yhat = func(x, *popt)
+        yfit = func(xfit, *popt)
+        params = list(zip(names, popt))
+        label = model
+
+    ss_res = float(np.sum((y - yhat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return params, r2, xfit, yfit, label
+
+
 # ── Editable trace-data table model ─────────────────────────────────────────────
 class TraceTableModel(QAbstractTableModel):
     """Edits operate on the actual packet lists, so changes propagate to render
@@ -596,7 +771,15 @@ class FileTab(QWidget):
         self._table_model = None
         self._current_is_trace = False
         self._undo_stack = []
+        self._redo_stack = []
         self._undo_limit = 50
+
+        # analysis / render state
+        self._render_mode = "normal"      # "normal" | "fft"
+        self._fit_result = None           # dict(ax_key,x,y,label) or None
+        self._cursor = None
+        self.cursors_enabled = True
+        self.analysis_visible = False
 
         # Packed dict is the single source of truth for edits, render, and save.
         self.packet = self.graf.pack()
@@ -608,19 +791,23 @@ class FileTab(QWidget):
         outer.addWidget(self._build_lockbar())
 
         self.hsplit = QSplitter(Qt.Horizontal)
+        self.analysis = self._build_analysis_sidebar()
+        self.hsplit.addWidget(self.analysis)
         self.hsplit.addWidget(self._build_plot_panel())
         self.sidebar = self._build_sidebar()
         self.hsplit.addWidget(self.sidebar)
-        self.hsplit.setStretchFactor(0, 3)
-        self.hsplit.setStretchFactor(1, 2)
-        self.hsplit.setSizes([760, 480])
+        self.hsplit.setStretchFactor(0, 0)
+        self.hsplit.setStretchFactor(1, 3)
+        self.hsplit.setStretchFactor(2, 2)
+        self.hsplit.setSizes([300, 760, 480])
+        self.analysis.setVisible(False)
         self._saved_split_sizes = None
         outer.addWidget(self.hsplit, 1)  # the splitter takes all extra vertical space
 
-        # First render from the known-good loaded object.
-        try:
-            self._set_figure(self.graf.to_fig(window_title=self._make_title()))
-        except Exception:
+        self._refresh_analysis()
+        # First render (routes through _show_current so overlays/cursors apply).
+        ok, _ = self._show_current(graf=self.graf)
+        if not ok:
             self._set_figure(plt.figure())   # blank fallback; should not happen
         self.set_locked(True)
 
@@ -641,6 +828,11 @@ class FileTab(QWidget):
         self.undo_btn.setFixedHeight(28)
         self.undo_btn.clicked.connect(self.undo)
 
+        self.redo_btn = QPushButton("Redo")
+        self.redo_btn.setObjectName("miniButton")
+        self.redo_btn.setFixedHeight(28)
+        self.redo_btn.clicked.connect(self.redo)
+
         self.revert_btn = QPushButton("Revert")
         self.revert_btn.setObjectName("miniButton")
         self.revert_btn.setFixedHeight(28)
@@ -649,6 +841,7 @@ class FileTab(QWidget):
         h.addWidget(self.lock_btn)
         h.addSpacing(8)
         h.addWidget(self.undo_btn)
+        h.addWidget(self.redo_btn)
         h.addWidget(self.revert_btn)
         h.addStretch(1)
         return bar
@@ -659,6 +852,203 @@ class FileTab(QWidget):
         self._plot_layout = QVBoxLayout(self._plot_container)
         self._plot_layout.setContentsMargins(0, 0, 0, 0)
         return self._plot_container
+
+    # -- left: analysis (stats / fit / FFT) -----------------------------------
+    def _build_analysis_sidebar(self):
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 4, 0)
+        v.setSpacing(4)
+
+        hdr = QLabel("ANALYSIS"); hdr.setObjectName("sectionHeader")
+        v.addWidget(hdr)
+
+        self.an_combo = QComboBox()
+        self.an_combo.currentIndexChanged.connect(self._an_select)
+        v.addWidget(self.an_combo)
+
+        # Statistics
+        st = QLabel("STATISTICS"); st.setObjectName("sectionHeader")
+        v.addWidget(st)
+        self.stats_tree = QTreeWidget()
+        self.stats_tree.setColumnCount(2)
+        self.stats_tree.setHeaderLabels(["Metric", "Value"])
+        self.stats_tree.setRootIsDecorated(False)
+        self.stats_tree.setMaximumHeight(190)
+        v.addWidget(self.stats_tree)
+
+        # Curve fit
+        cf = QLabel("CURVE FIT"); cf.setObjectName("sectionHeader")
+        v.addWidget(cf)
+        fitrow = QFormLayout(); fitrow.setContentsMargins(0, 0, 0, 0)
+        self.fit_model = QComboBox()
+        self.fit_model.addItems(["Linear", "Polynomial"] + [k for k in FIT_MODELS if k != "Linear"])
+        self.fit_model.currentTextChanged.connect(self._on_fit_model_changed)
+        fitrow.addRow("Model", self.fit_model)
+        self.fit_degree = QSpinBox(); self.fit_degree.setRange(1, 12); self.fit_degree.setValue(2)
+        self.fit_degree.setEnabled(False)        # only used by the Polynomial model
+        fitrow.addRow("Degree", self.fit_degree)
+        v.addLayout(fitrow)
+        fbtns = QHBoxLayout(); fbtns.setContentsMargins(0, 0, 0, 0)
+        self.fit_btn = QPushButton("Fit"); self.fit_btn.setObjectName("miniButton")
+        self.fit_btn.clicked.connect(self._do_fit)
+        self.fit_clear_btn = QPushButton("Clear"); self.fit_clear_btn.setObjectName("miniButton")
+        self.fit_clear_btn.clicked.connect(self._clear_fit)
+        fbtns.addWidget(self.fit_btn); fbtns.addWidget(self.fit_clear_btn); fbtns.addStretch(1)
+        v.addLayout(fbtns)
+        self.fit_result_label = QLabel(""); self.fit_result_label.setObjectName("welcomeHint")
+        self.fit_result_label.setWordWrap(True)
+        v.addWidget(self.fit_result_label)
+
+        # FFT
+        ft = QLabel("FFT"); ft.setObjectName("sectionHeader")
+        v.addWidget(ft)
+        self.fft_check = QCheckBox("Show FFT of this trace")
+        self.fft_check.toggled.connect(self._on_fft_toggle)
+        v.addWidget(self.fft_check)
+        fftform = QFormLayout(); fftform.setContentsMargins(0, 0, 0, 0)
+        self.fft_window = QComboBox(); self.fft_window.addItems(FFT_WINDOWS)
+        self.fft_window.setCurrentText("Hann")
+        self.fft_window.currentTextChanged.connect(self._on_fft_param_changed)
+        fftform.addRow("Window", self.fft_window)
+        self.fft_db = QCheckBox("magnitude in dB"); self.fft_db.setChecked(True)
+        self.fft_db.toggled.connect(self._on_fft_param_changed)
+        fftform.addRow("", self.fft_db)
+        self.fft_from = QLineEdit(); self.fft_from.setValidator(QDoubleValidator())
+        self.fft_from.setPlaceholderText("min")
+        self.fft_from.editingFinished.connect(self._on_fft_param_changed)
+        fftform.addRow("From X", self.fft_from)
+        self.fft_to = QLineEdit(); self.fft_to.setValidator(QDoubleValidator())
+        self.fft_to.setPlaceholderText("max")
+        self.fft_to.editingFinished.connect(self._on_fft_param_changed)
+        fftform.addRow("To X", self.fft_to)
+        v.addLayout(fftform)
+        rng = QHBoxLayout(); rng.setContentsMargins(0, 0, 0, 0)
+        self.fft_reset_btn = QPushButton("Full range"); self.fft_reset_btn.setObjectName("miniButton")
+        self.fft_reset_btn.clicked.connect(self._reset_fft_range)
+        rng.addWidget(self.fft_reset_btn); rng.addStretch(1)
+        v.addLayout(rng)
+        self.fft_status = QLabel(""); self.fft_status.setObjectName("welcomeHint")
+        self.fft_status.setWordWrap(True)
+        v.addWidget(self.fft_status)
+
+        v.addStretch(1)
+        if mplcursors is None or _scipy_curve_fit is None:
+            miss = []
+            if mplcursors is None:
+                miss.append("mplcursors (cursors)")
+            if _scipy_curve_fit is None:
+                miss.append("scipy (most fits / Flattop window)")
+            note = QLabel("Optional: pip install " +
+                          ", ".join(m.split()[0] for m in miss))
+            note.setObjectName("welcomeHint"); note.setWordWrap(True)
+            v.addWidget(note)
+        return panel
+
+    # -- analysis: trace selection + stats ------------------------------------
+    def _analysis_traces(self):
+        return [it for it in enumerate_data_items(self.packet) if it["kind"] == "trace"]
+
+    def _current_analysis_trace(self):
+        traces = self._analysis_traces()
+        i = self.an_combo.currentIndex()
+        if 0 <= i < len(traces):
+            return traces[i]
+        return None
+
+    def _refresh_analysis(self):
+        """Re-enumerate traces, refresh stats; keep selection where possible."""
+        traces = self._analysis_traces()
+        cur = self.an_combo.currentIndex()
+        self.an_combo.blockSignals(True)
+        self.an_combo.clear()
+        for it in traces:
+            self.an_combo.addItem(it["label"])
+        if not traces:
+            self.an_combo.addItem("(no traces)")
+            self.an_combo.setEnabled(False)
+        else:
+            self.an_combo.setEnabled(True)
+            self.an_combo.setCurrentIndex(min(max(cur, 0), len(traces) - 1))
+        self.an_combo.blockSignals(False)
+        self._update_stats()
+
+    def _update_stats(self):
+        self.stats_tree.clear()
+        item = self._current_analysis_trace()
+        if item is None:
+            return
+        stats = trace_statistics(self._as_list(item["node"], "y_data"))
+        if stats is None:
+            QTreeWidgetItem(self.stats_tree, ["(no finite Y data)", ""])
+            return
+        for name, val in stats:
+            QTreeWidgetItem(self.stats_tree, [name, val])
+        self.stats_tree.resizeColumnToContents(0)
+
+    def _an_select(self, _idx):
+        self._clear_fit(rerender=False)
+        self._reset_fft_range(rerender=False)
+        self._update_stats()
+        if self._render_mode == "fft":
+            self._show_current()
+
+    # -- curve fit -------------------------------------------------------------
+    def _on_fit_model_changed(self, name):
+        self.fit_degree.setEnabled(name == "Polynomial")
+
+    def _do_fit(self):
+        item = self._current_analysis_trace()
+        if item is None:
+            self.fit_result_label.setText("No trace selected.")
+            return
+        node = item["node"]
+        x = self._as_list(node, "x_data")
+        y = self._as_list(node, "y_data")
+        try:
+            params, r2, xfit, yfit, label = fit_trace(
+                x, y, self.fit_model.currentText(), self.fit_degree.value())
+        except Exception as exc:
+            self.fit_result_label.setText(f"Fit failed: {exc}")
+            return
+        self._fit_result = {"ax_key": item["axis"], "x": xfit, "y": yfit, "label": label}
+        txt = "  ".join(f"{n}={v:.5g}" for n, v in params)
+        self.fit_result_label.setText(f"{label}:  {txt}\nR² = {r2:.5f}")
+        if self._render_mode == "normal":
+            self._show_current()
+
+    def _clear_fit(self, rerender=True):
+        had = self._fit_result is not None
+        self._fit_result = None
+        self.fit_result_label.setText("")
+        if had and rerender and self._render_mode == "normal":
+            self._show_current()
+
+    # -- FFT -------------------------------------------------------------------
+    def _fft_range(self):
+        def parse(le):
+            t = le.text().strip()
+            try:
+                return float(t)
+            except ValueError:
+                return None
+        return parse(self.fft_from), parse(self.fft_to)
+
+    def _on_fft_toggle(self, on):
+        self._render_mode = "fft" if on else "normal"
+        self._show_current()
+
+    def _on_fft_param_changed(self, *_):
+        if self._render_mode == "fft":
+            self._show_current()
+
+    def _reset_fft_range(self, rerender=True):
+        item = self._current_analysis_trace()
+        self.fft_from.blockSignals(True); self.fft_to.blockSignals(True)
+        self.fft_from.clear(); self.fft_to.clear()
+        self.fft_from.blockSignals(False); self.fft_to.blockSignals(False)
+        if rerender and self._render_mode == "fft":
+            self._show_current()
 
     # -- right: structure + trace data ----------------------------------------
     def _build_sidebar(self):
@@ -937,7 +1327,9 @@ class FileTab(QWidget):
 
     def _commit_data_edit(self, r, c):
         self._mark_modified()
+        self._clear_fit(rerender=False)
         ok, _ = self._rerender_from_packet()
+        self._update_stats()
         return ok
 
     def _add_row(self):
@@ -946,8 +1338,10 @@ class FileTab(QWidget):
         self._snapshot()
         self._table_model.add_row()
         self._mark_modified()
+        self._clear_fit(rerender=False)
         self._rerender_from_packet()
         self._refresh_structure_preserving()
+        self._update_stats()
 
     def _remove_row(self):
         if self.locked or self._table_model is None or not self._current_is_trace:
@@ -960,8 +1354,10 @@ class FileTab(QWidget):
         self._snapshot()
         self._table_model.remove_row(r)
         self._mark_modified()
+        self._clear_fit(rerender=False)
         self._rerender_from_packet()
         self._refresh_structure_preserving()
+        self._update_stats()
 
     def _refresh_structure_preserving(self):
         # Row counts changed, so dataset shapes need refreshing. Rebuild the tree
@@ -999,17 +1395,20 @@ class FileTab(QWidget):
         self.add_btn.setEnabled(editable_table)
         self.del_btn.setEnabled(editable_table)
 
-    # -- undo / revert ---------------------------------------------------------
+    # -- undo / redo / revert --------------------------------------------------
     def _snapshot(self):
-        """Push the current packet onto the undo stack (called before a change)."""
+        """Push the current packet onto the undo stack (called before a change).
+        A fresh change invalidates the redo history."""
         self._undo_stack.append(copy.deepcopy(self.packet))
         if len(self._undo_stack) > self._undo_limit:
             self._undo_stack.pop(0)
+        self._redo_stack.clear()
 
     def undo(self):
         if not self._undo_stack:
             self.struct_status.setText("Nothing to undo")
             return
+        self._redo_stack.append(copy.deepcopy(self.packet))   # current → redo
         self.packet = self._undo_stack.pop()
         self._reload_views()
         # Empty stack after popping ⇒ back at the as-loaded state.
@@ -1017,8 +1416,19 @@ class FileTab(QWidget):
         self.modifiedChanged.emit()
         self.struct_status.setText("Undid last change")
 
+    def redo(self):
+        if not self._redo_stack:
+            self.struct_status.setText("Nothing to redo")
+            return
+        self._undo_stack.append(copy.deepcopy(self.packet))   # current → undo
+        self.packet = self._redo_stack.pop()
+        self._reload_views()
+        self.modified = True
+        self.modifiedChanged.emit()
+        self.struct_status.setText("Redid last change")
+
     def revert(self):
-        if not self.modified and not self._undo_stack:
+        if not self.modified and not self._undo_stack and not self._redo_stack:
             self.struct_status.setText("Already at original")
             return
         resp = QMessageBox.question(
@@ -1030,6 +1440,7 @@ class FileTab(QWidget):
             return
         self.packet = copy.deepcopy(self._original_packet)
         self._undo_stack.clear()
+        self._redo_stack.clear()
         self._reload_views()
         self.modified = False
         self.modifiedChanged.emit()
@@ -1054,6 +1465,8 @@ class FileTab(QWidget):
             self._on_select(idx)
         else:
             self._on_select(-1)
+        self._fit_result = None
+        self._refresh_analysis()
         self._rerender_from_packet()
 
     # -- rendering -------------------------------------------------------------
@@ -1078,13 +1491,113 @@ class FileTab(QWidget):
     def _rerender_from_packet(self):
         try:
             g = self._build_graf_from_packet()
-            fig = g.to_fig(window_title=self._make_title())
+        except Exception as exc:
+            return False, exc
+        ok, err = self._show_current(graf=g)
+        if ok:
+            self.graf = g
+            self._clear_tree_invalids()
+        return ok, err
+
+    def _show_current(self, graf=None):
+        """Build and display the figure for the current mode, with the fit
+        overlay and data cursors applied. Returns (ok, err); on failure the
+        previous figure is left in place."""
+        g = graf if graf is not None else self.graf
+        try:
+            if self._render_mode == "fft":
+                fig = self._build_fft_figure()
+            else:
+                fig = g.to_fig(window_title=self._make_title())
+                self._apply_fit_overlay(fig)
         except Exception as exc:
             return False, exc
         self._set_figure(fig)
-        self.graf = g
-        self._clear_tree_invalids()
+        self._attach_cursors(fig)
         return True, None
+
+    def _apply_fit_overlay(self, fig):
+        if not self._fit_result:
+            return
+        try:
+            ax_keys = list(self.packet.get("axes", {}).keys())
+            key = self._fit_result["ax_key"]
+            idx = ax_keys.index(key) if key in ax_keys else 0
+            if idx < len(fig.axes):
+                ax = fig.axes[idx]
+                ax.plot(self._fit_result["x"], self._fit_result["y"],
+                        "--", color="#d1495b", linewidth=1.6,
+                        label=f"fit: {self._fit_result['label']}", zorder=10)
+                ax.legend(loc="best", fontsize="small")
+        except Exception:
+            pass
+
+    def _build_fft_figure(self):
+        item = self._current_analysis_trace()
+        if item is None:
+            raise ValueError("no trace selected for FFT")
+        node = item["node"]
+        x = self._as_list(node, "x_data")
+        y = self._as_list(node, "y_data")
+        xmin, xmax = self._fft_range()
+        freq, mag, info, uniform = compute_fft(
+            x, y, window=self.fft_window.currentText(),
+            db=self.fft_db.isChecked(), xmin=xmin, xmax=xmax)
+        self.fft_status.setText(info)
+        try:
+            w_in = self.graf.fig_width_cm / 2.54
+            h_in = self.graf.fig_height_cm / 2.54
+        except Exception:
+            w_in, h_in = 6.4, 4.8
+        fig = plt.figure(self._make_title(), figsize=(w_in, h_in))
+        ax = fig.add_subplot(111)
+        ax.plot(freq, mag, color="#4b89dc", linewidth=1.2)
+        ax.set_xlabel("Frequency" + ("" if uniform else " (per sample)"))
+        ax.set_ylabel("Magnitude (dB)" if self.fft_db.isChecked() else "Magnitude")
+        ax.set_title(f"FFT — {item['name'] or item['trace']}")
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        return fig
+
+    def _attach_cursors(self, fig):
+        self._cursor = None
+        if mplcursors is None or not self.cursors_enabled:
+            return
+        try:
+            lines = []
+            for ax in fig.axes:
+                lines.extend(ax.get_lines())
+            if not lines:
+                return
+            self._cursor = mplcursors.cursor(lines, hover=False)
+
+            @self._cursor.connect("add")
+            def _on_add(sel):
+                xv, yv = sel.target
+                sel.annotation.set_text(f"x = {xv:.6g}\ny = {yv:.6g}")
+                try:
+                    sel.annotation.get_bbox_patch().set(alpha=0.9)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def set_cursors_enabled(self, enabled):
+        self.cursors_enabled = enabled
+        if self.fig is not None:
+            self._attach_cursors(self.fig)
+
+    def set_analysis_visible(self, visible):
+        self.analysis_visible = visible
+        self.analysis.setVisible(visible)
+        if visible:
+            sizes = self.hsplit.sizes()
+            if sizes and sizes[0] < 50:                 # was collapsed → give it room
+                spare = sizes[0] + sizes[1]
+                sizes[0] = 300
+                sizes[1] = max(200, spare - 300)
+                self.hsplit.setSizes(sizes)
+            self._refresh_analysis()
 
     def _set_figure(self, fig):
         while self._plot_layout.count():
@@ -1258,11 +1771,55 @@ class GrafExplorer(QMainWindow):
         self.tabs.currentChanged.connect(self._on_tab_changed)
         self.stack.addWidget(self.tabs)
 
-        self.theme = replace(THEMES[DEFAULT_THEME])
-        self._sidebar_visible = True
+        self.settings = QSettings()
+        self._last_dir = self.settings.value("last_dir", "", type=str)
+        self._load_prefs()
         self._build_menu()
         self._apply_theme()
+        self._restore_geometry()
         self._sync_view()
+
+    # -- settings persistence (QSettings: macOS plist / Windows registry) -------
+    def _load_prefs(self):
+        s = self.settings
+        name = s.value("theme", DEFAULT_THEME, type=str)
+        if name not in THEMES:
+            name = DEFAULT_THEME
+        fam = s.value("font_family", "Sans", type=str)
+        if fam not in FONT_FAMILIES:
+            fam = "Sans"
+        try:
+            size = int(s.value("font_size", THEMES[DEFAULT_THEME].base_pt))
+        except (TypeError, ValueError):
+            size = THEMES[DEFAULT_THEME].base_pt
+        self._theme_name = name
+        self._font_family_key = fam
+        self.theme = replace(THEMES[name],
+                             ui_family=FONT_FAMILIES[fam],
+                             base_pt=max(9, min(22, size)))
+        self._sidebar_visible = s.value("sidebar_visible", True, type=bool)
+        self._analysis_visible = s.value("analysis_visible", False, type=bool)
+        self._cursors_enabled = s.value("cursors_enabled", True, type=bool)
+
+    def _restore_geometry(self):
+        geo = self.settings.value("geometry")
+        if geo is not None:
+            try:
+                self.restoreGeometry(geo)
+            except Exception:
+                self.resize(1320, 840)
+        else:
+            self.resize(1320, 840)
+
+    def _remember_dir(self, path):
+        d = os.path.dirname(str(path))
+        if d:
+            self._last_dir = d
+            self.settings.setValue("last_dir", d)
+
+    def closeEvent(self, event):
+        self.settings.setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
 
     def _build_welcome(self):
         w = QWidget()
@@ -1315,6 +1872,9 @@ class GrafExplorer(QMainWindow):
         act_undo = editmenu.addAction("Undo")
         act_undo.setShortcut(QKeySequence.Undo)        # Cmd+Z / Ctrl+Z
         act_undo.triggered.connect(self._undo_current)
+        act_redo = editmenu.addAction("Redo")
+        act_redo.setShortcut(QKeySequence.Redo)        # Cmd+Shift+Z / Ctrl+Y
+        act_redo.triggered.connect(self._redo_current)
         act_lock = editmenu.addAction("Toggle Lock")
         act_lock.setShortcut("Ctrl+L")                 # Cmd+L on macOS
         act_lock.triggered.connect(self._toggle_lock_current)
@@ -1329,13 +1889,24 @@ class GrafExplorer(QMainWindow):
         self._sidebar_action.setChecked(self._sidebar_visible)
         self._sidebar_action.setShortcut("Ctrl+B")     # Cmd+B on macOS
         self._sidebar_action.toggled.connect(self._toggle_sidebar)
+
+        self._analysis_action = viewmenu.addAction("Show Analysis Panel")
+        self._analysis_action.setCheckable(True)
+        self._analysis_action.setChecked(self._analysis_visible)
+        self._analysis_action.setShortcut("Ctrl+Shift+A")
+        self._analysis_action.toggled.connect(self._toggle_analysis)
+
+        self._cursors_action = viewmenu.addAction("Data Cursors")
+        self._cursors_action.setCheckable(True)
+        self._cursors_action.setChecked(self._cursors_enabled)
+        self._cursors_action.toggled.connect(self._toggle_cursors)
         viewmenu.addSeparator()
 
         theme_menu = viewmenu.addMenu("Theme")
         self._theme_group = QActionGroup(self); self._theme_group.setExclusive(True)
         for tname in THEMES:
             a = theme_menu.addAction(tname); a.setCheckable(True)
-            a.setChecked(tname == DEFAULT_THEME)
+            a.setChecked(tname == self._theme_name)
             a.triggered.connect(lambda _c, n=tname: self._set_theme(n))
             self._theme_group.addAction(a)
 
@@ -1344,7 +1915,7 @@ class GrafExplorer(QMainWindow):
         self._family_group = QActionGroup(self); self._family_group.setExclusive(True)
         for fkey in FONT_FAMILIES:
             a = fam_menu.addAction(fkey); a.setCheckable(True)
-            a.setChecked(fkey == "Sans")
+            a.setChecked(fkey == self._font_family_key)
             a.triggered.connect(lambda _c, k=fkey: self._set_font_family(k))
             self._family_group.addAction(a)
         font_menu.addSeparator()
@@ -1362,10 +1933,14 @@ class GrafExplorer(QMainWindow):
     def _set_theme(self, name):
         self.theme = replace(THEMES[name], ui_family=self.theme.ui_family,
                              base_pt=self.theme.base_pt)
+        self._theme_name = name
+        self.settings.setValue("theme", name)
         self._apply_theme()
 
     def _set_font_family(self, key):
         self.theme.ui_family = FONT_FAMILIES[key]
+        self._font_family_key = key
+        self.settings.setValue("font_family", key)
         self._apply_theme()
 
     def _change_font_size(self, delta):
@@ -1373,12 +1948,16 @@ class GrafExplorer(QMainWindow):
 
     def _set_font_size(self, pt):
         self.theme.base_pt = max(9, min(22, int(pt)))
+        self.settings.setValue("font_size", self.theme.base_pt)
         self._apply_theme()
 
     # -- file ops --------------------------------------------------------------
     def open_dialog(self):
         paths, _ = QFileDialog.getOpenFileNames(
-            self, "Open GrAF file(s)", "", "GrAF files (*.graf);;All files (*)")
+            self, "Open GrAF file(s)", self._last_dir,
+            "GrAF files (*.graf);;All files (*)")
+        if paths:
+            self._remember_dir(paths[0])
         self.open_paths(paths)
 
     def open_paths(self, paths):
@@ -1401,6 +1980,8 @@ class GrafExplorer(QMainWindow):
         self.tabs.setCurrentIndex(idx)
         tab.modifiedChanged.connect(lambda t=tab: self._refresh_tab_text(t))
         tab.set_sidebar_visible(self._sidebar_visible)
+        tab.set_cursors_enabled(self._cursors_enabled)
+        tab.set_analysis_visible(self._analysis_visible)
         self._sync_view()
 
     def _save_current(self):
@@ -1416,6 +1997,11 @@ class GrafExplorer(QMainWindow):
         t = self._current_tab()
         if t:
             t.undo()
+
+    def _redo_current(self):
+        t = self._current_tab()
+        if t:
+            t.redo()
 
     def _toggle_lock_current(self):
         t = self._current_tab()
@@ -1439,10 +2025,27 @@ class GrafExplorer(QMainWindow):
 
     def _toggle_sidebar(self, visible):
         self._sidebar_visible = visible
+        self.settings.setValue("sidebar_visible", visible)
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, FileTab):
                 w.set_sidebar_visible(visible)
+
+    def _toggle_analysis(self, visible):
+        self._analysis_visible = visible
+        self.settings.setValue("analysis_visible", visible)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_analysis_visible(visible)
+
+    def _toggle_cursors(self, enabled):
+        self._cursors_enabled = enabled
+        self.settings.setValue("cursors_enabled", enabled)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_cursors_enabled(enabled)
 
     def _refresh_tab_text(self, tab):
         idx = self.tabs.indexOf(tab)
@@ -1525,6 +2128,8 @@ def main():
 
     app = QApplication(sys.argv)
     app.setApplicationName("GrAF Explorer")
+    app.setOrganizationName("grantgiesbrecht")          # QSettings scope...
+    app.setOrganizationDomain("com.grantgiesbrecht")    # ...macOS plist / Windows registry
     app.setWindowIcon(application_icon())     # title bar + taskbar icon
     app.setStyle(QStyleFactory.create("Fusion"))
 
