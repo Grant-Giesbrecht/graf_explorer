@@ -489,6 +489,36 @@ def collect_trace_data(packet):
     return out
 
 
+def _axis_label(ax, key):
+    """Pull a Scale's label out of a packed axis dict, defensively."""
+    scale = ax.get(key)
+    if isinstance(scale, dict):
+        lab = scale.get("label", "")
+        return lab if isinstance(lab, str) else ""
+    return ""
+
+
+def overlay_traces_from_packet(packet, fname):
+    """Flatten a file's traces for the comparison view, keeping each trace's
+    parent-axis X/Y labels so the overlay can label its axes sensibly."""
+    out = []
+    for ax_key, ax in (packet.get("axes", {}) or {}).items():
+        xlabel = _axis_label(ax, "x_axis")
+        ylabel = _axis_label(ax, "y_axis_L")
+        for tr_key, tr in (ax.get("traces", {}) or {}).items():
+            out.append({
+                "file": fname,
+                "axis": ax_key,
+                "trace": tr_key,
+                "name": tr.get("display_name", "") or "",
+                "x": _to_number_list(tr.get("x_data", [])),
+                "y": _to_number_list(tr.get("y_data", [])),
+                "xlabel": xlabel,
+                "ylabel": ylabel,
+            })
+    return out
+
+
 # ── Analysis helpers (stats / FFT / curve fitting) ──────────────────────────────
 def trace_statistics(y):
     a = np.asarray(y, dtype=float)
@@ -789,6 +819,7 @@ class FileTab(QWidget):
         self._fft_on = False              # show FFT axes below the main graph
         self._fit_result = None           # dict(ax_key,x,y,label) or None
         self._cursor = None
+        self._hidden_traces = set()       # {(ax_key, tr_key)} hidden from the plot
         self.cursors_enabled = True
         self.analysis_visible = False
 
@@ -1131,6 +1162,14 @@ class FileTab(QWidget):
             self.combo.setEnabled(False)
         self.combo.currentIndexChanged.connect(self._on_select)
 
+        selrow = QWidget()
+        sr = QHBoxLayout(selrow); sr.setContentsMargins(0, 0, 0, 0)
+        self.visible_cb = QCheckBox("Visible")
+        self.visible_cb.setChecked(True)
+        self.visible_cb.toggled.connect(self._on_visible_toggled)
+        sr.addWidget(self.combo, 1)
+        sr.addWidget(self.visible_cb)
+
         self.table = QTableView()
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setDefaultSectionSize(22)
@@ -1150,7 +1189,7 @@ class FileTab(QWidget):
         self.row_label.setObjectName("welcomeHint")
 
         bl.addWidget(header2)
-        bl.addWidget(self.combo)
+        bl.addWidget(selrow)
         bl.addWidget(self.table)
         bl.addWidget(rowbtns)
         bl.addWidget(self.row_label)
@@ -1344,7 +1383,38 @@ class FileTab(QWidget):
         self.table.setModel(model)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.row_label.setText(f"{model.rowCount()} points  ·  {len(cols)} columns  ·  {kind}")
+        self._sync_visible_cb(item)
         self._sync_edit_state()
+
+    def _sync_visible_cb(self, item):
+        """Reflect the selected item's visibility in the checkbox. Only traces
+        can be hidden; for surfaces the checkbox is disabled."""
+        self.visible_cb.blockSignals(True)
+        if item.get("kind") == "trace":
+            key = (item.get("axis"), item.get("trace"))
+            self.visible_cb.setEnabled(True)
+            self.visible_cb.setChecked(key not in self._hidden_traces)
+        else:
+            self.visible_cb.setEnabled(False)
+            self.visible_cb.setChecked(True)
+        self.visible_cb.blockSignals(False)
+
+    def _on_visible_toggled(self, visible):
+        idx = self.combo.currentIndex()
+        if not self.items or idx < 0 or idx >= len(self.items):
+            return
+        item = self.items[idx]
+        if item.get("kind") != "trace":
+            return
+        key = (item.get("axis"), item.get("trace"))
+        if visible:
+            self._hidden_traces.discard(key)
+        else:
+            self._hidden_traces.add(key)
+        # annotate the combo entry so hidden traces are visible at a glance
+        base = item["label"]
+        self.combo.setItemText(idx, base + ("" if visible else "   — hidden"))
+        self._show_current()
 
     def _commit_data_edit(self, r, c):
         self._mark_modified()
@@ -1474,8 +1544,13 @@ class FileTab(QWidget):
         self.combo.blockSignals(True)
         self.combo.clear()
         self.items = enumerate_data_items(self.packet)
+        # Drop visibility entries for traces that no longer exist.
+        live = {(it["axis"], it["trace"]) for it in self.items if it["kind"] == "trace"}
+        self._hidden_traces &= live
         for it in self.items:
-            self.combo.addItem(it["label"])
+            hidden = (it["kind"] == "trace"
+                      and (it["axis"], it["trace"]) in self._hidden_traces)
+            self.combo.addItem(it["label"] + ("   — hidden" if hidden else ""))
         if not self.items:
             self.combo.addItem("(no traces or surfaces)")
             self.combo.setEnabled(False)
@@ -1530,6 +1605,7 @@ class FileTab(QWidget):
             fig = g.to_fig(window_title=self._make_title())
         except Exception as exc:
             return False, exc
+        self._apply_trace_visibility(fig)
         self._apply_fit_overlay(fig)
         if self._fft_on:
             try:
@@ -1539,6 +1615,34 @@ class FileTab(QWidget):
         self._set_figure(fig)
         self._attach_cursors(fig)
         return True, None
+
+    def _apply_trace_visibility(self, fig):
+        """Hide the Line2D artists for any trace in self._hidden_traces and drop
+        their legend entries. Trace plot order matches the packet's traces dict
+        order, so the i-th line on axis k is the i-th trace of axis k."""
+        if not self._hidden_traces:
+            return
+        try:
+            axes = self.packet.get("axes", {}) or {}
+            for ax_idx, (ax_key, ax) in enumerate(axes.items()):
+                if ax_idx >= len(fig.axes):
+                    break
+                mpl_ax = fig.axes[ax_idx]
+                lines = mpl_ax.get_lines()
+                tr_keys = list((ax.get("traces", {}) or {}).keys())
+                for tr_idx, tr_key in enumerate(tr_keys):
+                    if tr_idx < len(lines) and (ax_key, tr_key) in self._hidden_traces:
+                        lines[tr_idx].set_visible(False)
+                # rebuild the legend from whatever remains visible
+                if mpl_ax.get_legend() is not None:
+                    keep = [ln for ln in mpl_ax.get_lines()
+                            if ln.get_visible() and not ln.get_label().startswith("_")]
+                    if keep:
+                        mpl_ax.legend(handles=keep, loc="best", fontsize="small")
+                    else:
+                        mpl_ax.get_legend().remove()
+        except Exception:
+            pass
 
     def _apply_fit_overlay(self, fig):
         if not self._fit_result or not self.fit_show.isChecked():
@@ -1800,6 +1904,185 @@ class FileTab(QWidget):
             self.fig = None
 
 
+# ── Comparison / overlay tab ────────────────────────────────────────────────────
+class OverlayTab(QWidget):
+    """Overlay selected traces from any number of open files on one plot.
+
+    Each trace gets a checkbox (file → traces); the checked set is the
+    visibility control for the comparison. Data is pulled live from the open
+    FileTabs' packets, so 'Refresh files' re-reads them after edits."""
+
+    def __init__(self, host):
+        super().__init__()
+        self.host = host                  # GrafExplorer (enumerates open files)
+        self.fig = None
+        self.canvas = None
+        self._checked = set()             # {(file, axis, trace)} kept across refresh
+        self._seq = 0
+        self._replot_timer = QTimer(self)
+        self._replot_timer.setSingleShot(True)
+        self._replot_timer.setInterval(40)
+        self._replot_timer.timeout.connect(self._do_replot)
+        self._build_ui()
+        self.refresh()
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        split = QSplitter(Qt.Horizontal)
+
+        self._plot_container = QWidget()
+        self._plot_layout = QVBoxLayout(self._plot_container)
+        self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        split.addWidget(self._plot_container)
+
+        ctl = QWidget()
+        cl = QVBoxLayout(ctl)
+        cl.setContentsMargins(4, 0, 0, 0)
+        hdr = QLabel("COMPARE TRACES")
+        hdr.setObjectName("sectionHeader")
+        cl.addWidget(hdr)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderLabels(["File / trace"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.itemChanged.connect(self._on_item_changed)
+        cl.addWidget(self.tree, 1)
+
+        self.legend_cb = QCheckBox("Legend"); self.legend_cb.setChecked(True)
+        self.legend_cb.toggled.connect(self._replot)
+        self.grid_cb = QCheckBox("Grid"); self.grid_cb.setChecked(True)
+        self.grid_cb.toggled.connect(self._replot)
+        cl.addWidget(self.legend_cb)
+        cl.addWidget(self.grid_cb)
+
+        btns = QHBoxLayout(); btns.setContentsMargins(0, 0, 0, 0)
+        refresh = QPushButton("Refresh files"); refresh.setObjectName("miniButton")
+        refresh.clicked.connect(self.refresh)
+        clear = QPushButton("Uncheck all"); clear.setObjectName("miniButton")
+        clear.clicked.connect(self._uncheck_all)
+        btns.addWidget(refresh); btns.addWidget(clear); btns.addStretch(1)
+        cl.addLayout(btns)
+
+        self.status = QLabel(""); self.status.setObjectName("welcomeHint")
+        self.status.setWordWrap(True)
+        cl.addWidget(self.status)
+
+        split.addWidget(ctl)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 1)
+        split.setSizes([820, 360])
+        outer.addWidget(split, 1)
+
+    def refresh(self, *args):
+        """Rescan open files; rebuild the tree, preserving checked traces."""
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        files = self.host.file_tabs()
+        for tab in files:
+            fname = tab.path.name
+            fitem = QTreeWidgetItem(self.tree, [fname])
+            fitem.setFlags(fitem.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
+            fitem.setExpanded(True)
+            for tr in overlay_traces_from_packet(tab.packet, fname):
+                label = f"{tr['trace']}   {tr['name']}".strip()
+                citem = QTreeWidgetItem(fitem, [label])
+                citem.setFlags(citem.flags() | Qt.ItemIsUserCheckable)
+                citem.setData(0, Qt.UserRole, tr)
+                key = (fname, tr["axis"], tr["trace"])
+                citem.setCheckState(0, Qt.Checked if key in self._checked else Qt.Unchecked)
+        self.tree.blockSignals(False)
+        if not files:
+            self.status.setText("No files open. Open a .graf file, then Refresh.")
+        self._replot()
+
+    def _iter_checked(self):
+        out = []
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            fitem = root.child(i)
+            for j in range(fitem.childCount()):
+                citem = fitem.child(j)
+                if citem.checkState(0) == Qt.Checked:
+                    tr = citem.data(0, Qt.UserRole)
+                    if tr is not None:
+                        out.append(tr)
+        return out
+
+    def _on_item_changed(self, item, _col):
+        tr = item.data(0, Qt.UserRole)
+        if tr is not None:                # leaf (trace) item
+            key = (tr["file"], tr["axis"], tr["trace"])
+            if item.checkState(0) == Qt.Checked:
+                self._checked.add(key)
+            else:
+                self._checked.discard(key)
+        self._replot()
+
+    def _uncheck_all(self):
+        self._checked.clear()
+        self.refresh()
+
+    def _replot(self, *args):
+        self._replot_timer.start()        # debounce bursts (e.g. parent toggles)
+
+    def _do_replot(self):
+        sel = self._iter_checked()
+        self._seq += 1
+        fig = plt.figure(f"overlay-{id(self)}-{self._seq}", figsize=(7.6, 5.0))
+        ax = fig.add_subplot(111)
+        n = 0
+        xlabel = ylabel = ""
+        for tr in sel:
+            x, y = tr["x"], tr["y"]
+            m = min(len(x), len(y))
+            if m == 0:
+                continue
+            ax.plot(x[:m], y[:m], linewidth=1.3,
+                    label=f"{tr['file']} · {tr['name'] or tr['trace']}")
+            n += 1
+            if not xlabel and tr.get("xlabel"):
+                xlabel = tr["xlabel"]
+            if not ylabel and tr.get("ylabel"):
+                ylabel = tr["ylabel"]
+        ax.set_xlabel(xlabel or "X")
+        ax.set_ylabel(ylabel or "Y")
+        if self.grid_cb.isChecked():
+            ax.grid(True, alpha=0.3)
+        if self.legend_cb.isChecked() and n:
+            ax.legend(loc="best", fontsize="small")
+        fig.tight_layout()
+        self._set_figure(fig)
+        nfiles = len(self.host.file_tabs())
+        self.status.setText(f"{n} trace(s) overlaid from {nfiles} open file(s)")
+
+    def _set_figure(self, fig):
+        while self._plot_layout.count():
+            w = self._plot_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        if self.fig is not None:
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
+        self.fig = fig
+        self.canvas = FigureCanvas(fig)
+        toolbar = NavigationToolbar(self.canvas, self)
+        self._plot_layout.addWidget(toolbar)
+        self._plot_layout.addWidget(self.canvas)
+        self.canvas.draw_idle()
+
+    def close_figure(self):
+        if self.fig is not None:
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
+            self.fig = None
+
+
 # ── Main window ────────────────────────────────────────────────────────────────
 class GrafExplorer(QMainWindow):
     def __init__(self):
@@ -1900,6 +2183,10 @@ class GrafExplorer(QMainWindow):
         act_close = filemenu.addAction("Close Tab")
         act_close.setShortcut(QKeySequence.Close)
         act_close.triggered.connect(self._close_current_tab)
+
+        act_compare = filemenu.addAction("New Comparison…")
+        act_compare.setShortcut("Ctrl+Shift+N")
+        act_compare.triggered.connect(self._new_comparison)
 
         filemenu.addSeparator()
         export_fig = filemenu.addMenu("Export to")
@@ -2032,6 +2319,24 @@ class GrafExplorer(QMainWindow):
         tab.set_sidebar_visible(self._sidebar_visible)
         tab.set_cursors_enabled(self._cursors_enabled)
         tab.set_analysis_visible(self._analysis_visible)
+        self._refresh_overlays()
+        self._sync_view()
+
+    def file_tabs(self):
+        """All open FileTabs, in tab order (used by comparison tabs)."""
+        return [self.tabs.widget(i) for i in range(self.tabs.count())
+                if isinstance(self.tabs.widget(i), FileTab)]
+
+    def _refresh_overlays(self):
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, OverlayTab):
+                w.refresh()
+
+    def _new_comparison(self):
+        tab = OverlayTab(self)
+        idx = self.tabs.addTab(tab, "Comparison")
+        self.tabs.setCurrentIndex(idx)
         self._sync_view()
 
     def _save_current(self):
@@ -2117,10 +2422,13 @@ class GrafExplorer(QMainWindow):
                 QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Cancel)
             if resp != QMessageBox.Discard:
                 return
-        if isinstance(w, FileTab):
+        was_file = isinstance(w, FileTab)
+        if hasattr(w, "close_figure"):
             w.close_figure()
         self.tabs.removeTab(index)
         w.deleteLater()
+        if was_file:
+            self._refresh_overlays()      # comparisons reflect the closed file
         self._sync_view()
 
     def _sync_view(self):
@@ -2128,7 +2436,9 @@ class GrafExplorer(QMainWindow):
 
     def _on_tab_changed(self, index):
         tab = self.tabs.widget(index)
-        if isinstance(tab, FileTab) and tab.canvas is not None:
+        if isinstance(tab, OverlayTab):
+            tab.refresh()                 # pick up edits made since last shown
+        if getattr(tab, "canvas", None) is not None:
             QTimer.singleShot(0, tab.canvas.draw_idle)
 
     # -- drag & drop -----------------------------------------------------------
