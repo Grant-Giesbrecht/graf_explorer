@@ -1869,14 +1869,40 @@ class FileTab(QWidget):
                 lines.extend(ax.get_lines())
             if not lines:
                 return
+            # Prefix datatips with the line's name when the plot has more than
+            # one labelled line — i.e. multiple traces, or a trace plus its fit.
+            # (The FFT line is unlabelled, so it never counts or shows a name.)
+            named = [ln for ln in lines
+                     if ln.get_label() and not ln.get_label().startswith("_")]
+            multi = len(named) >= 2
+
             # multiple=True → each click leaves a persistent datatip
             # (right-click a datatip to remove it).
             self._cursor = mplcursors.cursor(lines, hover=False, multiple=True)
 
             @self._cursor.connect("add")
             def _on_add(sel):
-                xv, yv = sel.target
-                sel.annotation.set_text(f"x = {xv:.6g}\ny = {yv:.6g}")
+                line = sel.artist
+                # Snap to the nearest actual data vertex (mplcursors otherwise
+                # interpolates along the connecting segment). Compare in pixel
+                # space so differing X/Y scales don't bias the choice.
+                x0, y0 = sel.target[0], sel.target[1]
+                try:
+                    xd = np.asarray(line.get_xdata(), dtype=float)
+                    yd = np.asarray(line.get_ydata(), dtype=float)
+                    if xd.size:
+                        pts = line.axes.transData.transform(np.column_stack([xd, yd]))
+                        tx, ty = line.axes.transData.transform((x0, y0))
+                        i = int(np.argmin((pts[:, 0] - tx) ** 2 + (pts[:, 1] - ty) ** 2))
+                        x0, y0 = float(xd[i]), float(yd[i])
+                        sel.annotation.xy = (x0, y0)     # point the arrow at the vertex
+                except Exception:
+                    pass
+                label = line.get_label() if line is not None else ""
+                prefix = ""
+                if multi and label and not str(label).startswith("_"):
+                    prefix = f"{label}\n"
+                sel.annotation.set_text(f"{prefix}x = {x0:.6g}\ny = {y0:.6g}")
                 try:
                     sel.annotation.get_bbox_patch().set(alpha=0.9)
                 except Exception:
@@ -1892,6 +1918,22 @@ class FileTab(QWidget):
     def set_legend_on(self, enabled):
         self.legend_on = enabled
         self._show_current()
+
+    def apply_tight_layout(self):
+        """Re-fit the axes into the canvas. Plain tight_layout preserves any
+        zoom/pan; for the FFT-stacked layout we re-render instead, since
+        tight_layout would collapse the manual two-band positioning."""
+        if self.fig is None:
+            return
+        if self._fft_on:
+            self._show_current()
+            return
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        if self.canvas is not None:
+            self.canvas.draw_idle()
 
     def set_analysis_visible(self, visible):
         self.analysis_visible = visible
@@ -2382,6 +2424,16 @@ class OverlayTab(QWidget):
                 pass
             self.fig = None
 
+    def apply_tight_layout(self):
+        if self.fig is None:
+            return
+        try:
+            self.fig.tight_layout()
+        except Exception:
+            pass
+        if self.canvas is not None:
+            self.canvas.draw_idle()
+
 
 # ── Main window ────────────────────────────────────────────────────────────────
 class GrafExplorer(QMainWindow):
@@ -2551,6 +2603,10 @@ class GrafExplorer(QMainWindow):
         self._legend_action.setCheckable(True)
         self._legend_action.setChecked(self._legend_on)
         self._legend_action.toggled.connect(self._toggle_legend)
+
+        act_tight = viewmenu.addAction("Tight Layout")
+        act_tight.setShortcut("Ctrl+R")
+        act_tight.triggered.connect(self._tight_layout_all)
         viewmenu.addSeparator()
 
         theme_menu = viewmenu.addMenu("Theme")
@@ -2760,6 +2816,14 @@ class GrafExplorer(QMainWindow):
             w = self.tabs.widget(i)
             if isinstance(w, FileTab):
                 w.set_legend_on(enabled)
+
+    def _tight_layout_all(self):
+        """Re-fit axes into the canvas for every open tab (Ctrl+R). Useful after
+        dragging the side panels leaves a plot's axes clipped or off-screen."""
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if hasattr(w, "apply_tight_layout"):
+                w.apply_tight_layout()
 
     def _refresh_tab_text(self, tab):
         idx = self.tabs.indexOf(tab)
