@@ -57,6 +57,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QFileDialog, QMessageBox, QStyleFactory, QHeaderView,
     QPushButton, QAbstractItemView, QActionGroup, QCheckBox, QSizePolicy,
     QLineEdit, QSpinBox, QGridLayout, QFormLayout,
+    QMenu, QInputDialog,
 )
 
 # Optional analysis dependencies — the app still runs without them, the relevant
@@ -500,7 +501,8 @@ def _axis_label(ax, key):
 
 def overlay_traces_from_packet(packet, fname):
     """Flatten a file's traces for the comparison view, keeping each trace's
-    parent-axis X/Y labels so the overlay can label its axes sensibly."""
+    parent-axis X/Y labels and its own formatting (so the overlay can either
+    reuse the source format or fall back to defaults)."""
     out = []
     for ax_key, ax in (packet.get("axes", {}) or {}).items():
         xlabel = _axis_label(ax, "x_axis")
@@ -515,8 +517,64 @@ def overlay_traces_from_packet(packet, fname):
                 "y": _to_number_list(tr.get("y_data", [])),
                 "xlabel": xlabel,
                 "ylabel": ylabel,
+                "line_color": tr.get("line_color"),
+                "line_type": tr.get("line_type"),
+                "marker_type": tr.get("marker_type"),
+                "marker_size": tr.get("marker_size"),
+                "line_width": tr.get("line_width"),
+                "alpha": tr.get("alpha"),
             })
     return out
+
+
+def overlay_plot_kwargs(tr):
+    """matplotlib plot kwargs reproducing a trace's stored format (graf's
+    LINE_TYPES/MARKER_TYPES are already mpl-native, except '[]' → square)."""
+    kw = {}
+    lc = tr.get("line_color")
+    if lc is not None:
+        try:
+            kw["color"] = tuple(float(c) for c in lc)
+        except Exception:
+            pass
+    lt = tr.get("line_type")
+    if lt:
+        kw["linestyle"] = lt
+    mt = tr.get("marker_type")
+    if mt and mt != "None":
+        kw["marker"] = "s" if mt == "[]" else mt
+    for src, dst in (("line_width", "linewidth"), ("alpha", "alpha"),
+                     ("marker_size", "markersize")):
+        v = tr.get(src)
+        if v is not None:
+            try:
+                kw[dst] = float(v)
+            except Exception:
+                pass
+    return kw
+
+
+def default_color_cycle():
+    """matplotlib's current default color cycle as a list of RGB tuples."""
+    try:
+        import matplotlib as mpl
+        from matplotlib.colors import to_rgb
+        cols = mpl.rcParams["axes.prop_cycle"].by_key().get("color", [])
+        return [to_rgb(c) for c in cols] or [(0.12, 0.47, 0.71)]
+    except Exception:
+        return [(0.12, 0.47, 0.71)]
+
+
+def apply_default_trace_format(tr_dict, rgb):
+    """Reset a packed trace dict's format fields to clean defaults in `rgb`."""
+    color = [float(c) for c in rgb]
+    tr_dict["line_color"] = color
+    tr_dict["marker_color"] = color
+    tr_dict["line_type"] = "-"
+    tr_dict["marker_type"] = "None"
+    tr_dict["marker_size"] = 1
+    tr_dict["line_width"] = 1
+    tr_dict["alpha"] = 1
 
 
 # ── Analysis helpers (stats / FFT / curve fitting) ──────────────────────────────
@@ -1918,6 +1976,7 @@ class OverlayTab(QWidget):
         self.fig = None
         self.canvas = None
         self._checked = set()             # {(file, axis, trace)} kept across refresh
+        self._bring_format = set()        # {(file, axis, trace)} → use source format
         self._seq = 0
         self._replot_timer = QTimer(self)
         self._replot_timer.setSingleShot(True)
@@ -1944,10 +2003,22 @@ class OverlayTab(QWidget):
         cl.addWidget(hdr)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File / trace"])
+        self.tree.setHeaderLabels(["File / trace", "Fmt"])
         self.tree.setRootIsDecorated(True)
+        self.tree.setColumnWidth(0, 240)
+        self.tree.header().setStretchLastSection(False)
+        try:
+            self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+            self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        except Exception:
+            pass
         self.tree.itemChanged.connect(self._on_item_changed)
         cl.addWidget(self.tree, 1)
+
+        hint = QLabel("First box shows the trace · “Fmt” keeps its own colour/style "
+                      "(off ⇒ default formatting).")
+        hint.setObjectName("welcomeHint"); hint.setWordWrap(True)
+        cl.addWidget(hint)
 
         self.legend_cb = QCheckBox("Legend"); self.legend_cb.setChecked(True)
         self.legend_cb.toggled.connect(self._replot)
@@ -1963,6 +2034,10 @@ class OverlayTab(QWidget):
         clear.clicked.connect(self._uncheck_all)
         btns.addWidget(refresh); btns.addWidget(clear); btns.addStretch(1)
         cl.addLayout(btns)
+
+        self.make_btn = QPushButton("Make GrAF…"); self.make_btn.setObjectName("miniButton")
+        self.make_btn.clicked.connect(self._make_graf)
+        cl.addWidget(self.make_btn)
 
         self.status = QLabel(""); self.status.setObjectName("welcomeHint")
         self.status.setWordWrap(True)
@@ -1986,11 +2061,13 @@ class OverlayTab(QWidget):
             fitem.setExpanded(True)
             for tr in overlay_traces_from_packet(tab.packet, fname):
                 label = f"{tr['trace']}   {tr['name']}".strip()
-                citem = QTreeWidgetItem(fitem, [label])
+                citem = QTreeWidgetItem(fitem, [label, ""])
                 citem.setFlags(citem.flags() | Qt.ItemIsUserCheckable)
                 citem.setData(0, Qt.UserRole, tr)
                 key = (fname, tr["axis"], tr["trace"])
                 citem.setCheckState(0, Qt.Checked if key in self._checked else Qt.Unchecked)
+                citem.setCheckState(1, Qt.Checked if key in self._bring_format else Qt.Unchecked)
+                citem.setToolTip(1, "Keep this trace's own colour / line style")
         self.tree.blockSignals(False)
         if not files:
             self.status.setText("No files open. Open a .graf file, then Refresh.")
@@ -2009,18 +2086,25 @@ class OverlayTab(QWidget):
                         out.append(tr)
         return out
 
-    def _on_item_changed(self, item, _col):
+    def _on_item_changed(self, item, col):
         tr = item.data(0, Qt.UserRole)
         if tr is not None:                # leaf (trace) item
             key = (tr["file"], tr["axis"], tr["trace"])
-            if item.checkState(0) == Qt.Checked:
-                self._checked.add(key)
-            else:
-                self._checked.discard(key)
+            if col == 0:
+                if item.checkState(0) == Qt.Checked:
+                    self._checked.add(key)
+                else:
+                    self._checked.discard(key)
+            elif col == 1:
+                if item.checkState(1) == Qt.Checked:
+                    self._bring_format.add(key)
+                else:
+                    self._bring_format.discard(key)
         self._replot()
 
     def _uncheck_all(self):
         self._checked.clear()
+        self._bring_format.clear()
         self.refresh()
 
     def _replot(self, *args):
@@ -2038,8 +2122,10 @@ class OverlayTab(QWidget):
             m = min(len(x), len(y))
             if m == 0:
                 continue
-            ax.plot(x[:m], y[:m], linewidth=1.3,
-                    label=f"{tr['file']} · {tr['name'] or tr['trace']}")
+            key = (tr["file"], tr["axis"], tr["trace"])
+            kw = overlay_plot_kwargs(tr) if key in self._bring_format else {"linewidth": 1.3}
+            ax.plot(x[:m], y[:m],
+                    label=f"{tr['file']} · {tr['name'] or tr['trace']}", **kw)
             n += 1
             if not xlabel and tr.get("xlabel"):
                 xlabel = tr["xlabel"]
@@ -2055,6 +2141,109 @@ class OverlayTab(QWidget):
         self._set_figure(fig)
         nfiles = len(self.host.file_tabs())
         self.status.setText(f"{n} trace(s) overlaid from {nfiles} open file(s)")
+
+    def _make_graf(self):
+        """Build a new single-axis GrAF from the checked traces and open it."""
+        sel = self._iter_checked()
+        if not sel:
+            self.status.setText("Check at least one trace first.")
+            return
+        try:
+            packet = self._build_comparison_packet(sel)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not build GrAF",
+                                f"Failed to assemble the comparison:\n\n{exc}")
+            return
+        start = self.host._last_dir or ""
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save comparison as GrAF", os.path.join(start, "comparison.graf"),
+            "GrAF files (*.graf)")
+        if not path:
+            return
+        if not path.lower().endswith(".graf"):
+            path += ".graf"
+        try:
+            dict_to_tome(copy.deepcopy(packet), path, show_detail=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed",
+                                 f"Could not write {os.path.basename(path)}:\n\n{exc}")
+            return
+        self.host._remember_dir(path)
+        self.host.open_one(path)          # opens the new file as its own tab
+        self.status.setText(f"Made GrAF with {len(sel)} trace(s) → {os.path.basename(path)}")
+
+    def _build_comparison_packet(self, sel):
+        """Use the first selected trace's source file as a structural template,
+        reduce it to one axis, and fill it with the selected traces."""
+        template_tab = self.host.find_file_tab(sel[0]["file"])
+        if template_tab is None:
+            raise RuntimeError("source file is no longer open")
+        base = copy.deepcopy(template_tab.packet)
+        axes = base.get("axes", {}) or {}
+        if not axes:
+            raise RuntimeError("template file has no axes")
+        ax_key = sel[0]["axis"] if sel[0]["axis"] in axes else next(iter(axes))
+        axis = axes[ax_key]
+        base["axes"] = {ax_key: axis}          # single axis holds everything
+        axis["traces"] = {}
+        if "surfaces" in axis:
+            axis["surfaces"] = {}
+        if "supertitle" in base:
+            base["supertitle"] = "Comparison"
+
+        cycle = default_color_cycle()
+        for i, entry in enumerate(sel):
+            src_tab = self.host.find_file_tab(entry["file"])
+            if src_tab is None:
+                continue
+            try:
+                src = src_tab.packet["axes"][entry["axis"]]["traces"][entry["trace"]]
+            except (KeyError, TypeError):
+                continue
+            tr = copy.deepcopy(src)
+            key = (entry["file"], entry["axis"], entry["trace"])
+            if key not in self._bring_format:
+                apply_default_trace_format(tr, cycle[i % len(cycle)])
+            tr["display_name"] = f"{entry['file']} · {entry['name'] or entry['trace']}"
+            tr["include_in_legend"] = True
+            tr["use_yaxis_R"] = False         # everything shares the left axis
+            axis["traces"][f"Tr{i}"] = tr
+
+        # The stored Scale forces fixed limits/ticks on render, so recompute them
+        # to span the combined data (otherwise traces from other files get clipped).
+        self._rescale_axis(axis, sel)
+        if isinstance(axis.get("y_axis_R"), dict):
+            axis["y_axis_R"]["is_valid"] = False
+        return base
+
+    @staticmethod
+    def _rescale_axis(axis, sel):
+        def bounds(coord):
+            vals = []
+            for e in sel:
+                vals.extend(v for v in e.get(coord, [])
+                            if isinstance(v, (int, float)) and np.isfinite(v))
+            if not vals:
+                return None
+            return min(vals), max(vals)
+
+        def write(scale, lo, hi):
+            if not isinstance(scale, dict) or lo is None:
+                return
+            if hi <= lo:
+                hi = lo + 1.0
+            ticks = list(np.linspace(lo, hi, 6))
+            scale["is_valid"] = True
+            scale["val_min"] = lo - (hi - lo) * 0.05
+            scale["val_max"] = hi + (hi - lo) * 0.05
+            scale["tick_list"] = ticks
+            scale["minor_tick_list"] = []
+            scale["tick_label_list"] = [f"{t:.4g}" for t in ticks]
+
+        xb = bounds("x")
+        yb = bounds("y")
+        write(axis.get("x_axis"), *(xb if xb else (None, None)))
+        write(axis.get("y_axis_L"), *(yb if yb else (None, None)))
 
     def _set_figure(self, fig):
         while self._plot_layout.count():
@@ -2102,6 +2291,9 @@ class GrafExplorer(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.tabs.tabCloseRequested.connect(self._close_tab)
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        self.tabs.tabBar().setContextMenuPolicy(Qt.CustomContextMenu)
+        self.tabs.tabBar().customContextMenuRequested.connect(self._tab_context_menu)
+        self.tabs.tabBarDoubleClicked.connect(self._rename_tab)
         self.stack.addWidget(self.tabs)
 
         self.settings = QSettings()
@@ -2327,6 +2519,13 @@ class GrafExplorer(QMainWindow):
         return [self.tabs.widget(i) for i in range(self.tabs.count())
                 if isinstance(self.tabs.widget(i), FileTab)]
 
+    def find_file_tab(self, name):
+        """First open FileTab whose file name matches (used by Make GrAF)."""
+        for tab in self.file_tabs():
+            if tab.path.name == name:
+                return tab
+        return None
+
     def _refresh_overlays(self):
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
@@ -2406,8 +2605,41 @@ class GrafExplorer(QMainWindow):
         idx = self.tabs.indexOf(tab)
         if idx >= 0:
             star = "*" if tab.modified else ""
-            self.tabs.setTabText(idx, star + tab.path.name)
+            base = getattr(tab, "_custom_title", None) or tab.path.name
+            self.tabs.setTabText(idx, star + base)
             self.tabs.setTabToolTip(idx, str(tab.path.resolve()))
+
+    def _tab_context_menu(self, pos):
+        idx = self.tabs.tabBar().tabAt(pos)
+        if idx < 0:
+            return
+        menu = QMenu(self)
+        act_rename = menu.addAction("Rename…")
+        act_close = menu.addAction("Close")
+        chosen = menu.exec_(self.tabs.tabBar().mapToGlobal(pos))
+        if chosen == act_rename:
+            self._rename_tab(idx)
+        elif chosen == act_close:
+            self._close_tab(idx)
+
+    def _rename_tab(self, idx):
+        if idx < 0:
+            return
+        current = self.tabs.tabText(idx).lstrip("*")
+        name, ok = QInputDialog.getText(self, "Rename tab", "Tab name:", text=current)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        w = self.tabs.widget(idx)
+        # Persist the name so a FileTab's modified-marker refresh keeps it.
+        if w is not None:
+            w._custom_title = name
+        if isinstance(w, FileTab):
+            self._refresh_tab_text(w)     # re-applies "*" + custom name
+        else:
+            self.tabs.setTabText(idx, name)
 
     def _close_current_tab(self):
         if self.tabs.count():
