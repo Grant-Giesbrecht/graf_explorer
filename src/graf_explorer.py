@@ -41,6 +41,8 @@ import numpy as np
 import matplotlib
 matplotlib.use("Qt5Agg")           # Lock the backend BEFORE graf.base pulls in pyplot.
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.ticker import MaxNLocator
 from matplotlib.backends.backend_qt5agg import (
     FigureCanvasQTAgg as FigureCanvas,
     NavigationToolbar2QT as NavigationToolbar,
@@ -85,30 +87,45 @@ INVALID_RED = "#ff5b5b"
 ARRAY_EXPAND_LIMIT = 100   # 1-D arrays at or below this are expanded to editable rows
 
 
-def resource_path(*parts) -> str:
-    """Resolve a path that works both when run as a script and when frozen by
-    PyInstaller (which unpacks bundled data under sys._MEIPASS)."""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, *parts)
-
-
-def find_app_icon() -> str:
-    """Locate the application icon for the window/taskbar (NOT the same thing as
-    the .exe's embedded icon or the .graf document icon). Searches the frozen
-    bundle, the script dir, and its parent (so dev runs from src/ still work).
-    Prefers .ico on Windows for crisp multi-resolution rendering."""
+def _resource_bases():
+    """Candidate roots that may contain bundled resources, most specific first:
+    the PyInstaller unpack dir, the script's own dir, its parent (so a dev run
+    from src/ finds ../icons), and the working directory."""
     here = os.path.dirname(os.path.abspath(__file__))
     bases = []
     mp = getattr(sys, "_MEIPASS", None)
     if mp:
         bases.append(mp)
-    bases.extend([here, os.path.dirname(here)])
-    names = [("icons", "app", "graf_app.ico"), ("icons", "app", "graf_app.png")]
+    bases.extend([here, os.path.dirname(here), os.getcwd()])
+    seen, out = set(), []
+    for b in bases:
+        if b and b not in seen:
+            seen.add(b)
+            out.append(b)
+    return out
+
+
+def resource_path(*parts) -> str:
+    """Resolve a resource path that works when run as a script (from src/ or the
+    project root) and when frozen by PyInstaller. Returns the first existing
+    candidate; if none exist, returns the most-likely intended location so
+    callers can still test/branch on it."""
+    bases = _resource_bases()
     for base in bases:
-        for rel in names:
-            p = os.path.join(base, *rel)
-            if os.path.isfile(p):
-                return p
+        p = os.path.join(base, *parts)
+        if os.path.exists(p):
+            return p
+    return os.path.join(bases[0], *parts)
+
+
+def find_app_icon() -> str:
+    """Locate the application icon for the window/taskbar (NOT the same thing as
+    the .exe's embedded icon or the .graf document icon). Prefers .ico on
+    Windows for crisp multi-resolution rendering."""
+    for rel in (("icons", "app", "graf_app.ico"), ("icons", "app", "graf_app.png")):
+        p = resource_path(*rel)
+        if os.path.isfile(p):
+            return p
     return ""
 
 
@@ -344,6 +361,63 @@ def deep_listify(obj):
             if isinstance(obj[i], tuple):
                 obj[i] = list(obj[i])
             deep_listify(obj[i])
+
+
+def decode_bytes(v):
+    """Turn a bytes/np.bytes_ value into str (HDF5/TOME hands strings back as
+    bytes). '\\xe2\\x88\\x92' etc. are UTF-8, so decode as UTF-8 first."""
+    if isinstance(v, (bytes, bytearray, np.bytes_)):
+        try:
+            return bytes(v).decode("utf-8")
+        except Exception:
+            return bytes(v).decode("latin-1", "replace")
+    return v
+
+
+def deep_decode_bytes(obj):
+    """Recursively decode byte strings to str throughout a packed dict, in place.
+    Numeric data is untouched (only bytes are converted)."""
+    if isinstance(obj, dict):
+        for k in list(obj.keys()):
+            v = obj[k]
+            if isinstance(v, (bytes, bytearray, np.bytes_)):
+                obj[k] = decode_bytes(v)
+            else:
+                deep_decode_bytes(v)
+    elif isinstance(obj, list):
+        for i in range(len(obj)):
+            v = obj[i]
+            if isinstance(v, (bytes, bytearray, np.bytes_)):
+                obj[i] = decode_bytes(v)
+            else:
+                deep_decode_bytes(v)
+
+
+def sanitize_graf_text(g):
+    """Decode byte-string tick labels / axis labels / trace names on a loaded
+    Graf object so matplotlib renders text, not b'...' reprs. graf leaves these
+    as bytes because that's what the HDF5 reader returns."""
+    def dec_seq(seq):
+        if isinstance(seq, np.ndarray):
+            seq = seq.tolist()
+        if isinstance(seq, (list, tuple)):
+            return [decode_bytes(x) for x in seq]
+        return seq
+    try:
+        for ax in getattr(g, "axes", {}).values():
+            for attr in ("x_axis", "y_axis_L", "y_axis_R", "z_axis"):
+                sc = getattr(ax, attr, None)
+                if sc is None:
+                    continue
+                if hasattr(sc, "tick_label_list"):
+                    sc.tick_label_list = dec_seq(sc.tick_label_list)
+                if hasattr(sc, "label"):
+                    sc.label = decode_bytes(sc.label)
+            for tr in getattr(ax, "traces", {}).values():
+                if hasattr(tr, "display_name"):
+                    tr.display_name = decode_bytes(tr.display_name)
+    except Exception:
+        pass
 
 
 def _unwrap_scalar(v):
@@ -878,12 +952,14 @@ class FileTab(QWidget):
         self._fit_result = None           # dict(ax_key,x,y,label) or None
         self._cursor = None
         self._hidden_traces = set()       # {(ax_key, tr_key)} hidden from the plot
+        self.legend_on = True             # viewer-drawn legend (graf draws none)
         self.cursors_enabled = True
         self.analysis_visible = False
 
         # Packed dict is the single source of truth for edits, render, and save.
         self.packet = self.graf.pack()
         deep_listify(self.packet)
+        deep_decode_bytes(self.packet)      # HDF5 returns str fields as bytes
         self._original_packet = copy.deepcopy(self.packet)   # for "revert to original"
 
         outer = QVBoxLayout(self)
@@ -1659,6 +1735,7 @@ class FileTab(QWidget):
         figure is left in place. An FFT failure still shows the main graph and
         reports the reason on the FFT status line."""
         g = graf if graf is not None else self.graf
+        sanitize_graf_text(g)               # decode b'...' tick labels before draw
         try:
             fig = g.to_fig(window_title=self._make_title())
         except Exception as exc:
@@ -1670,14 +1747,15 @@ class FileTab(QWidget):
                 self._augment_with_fft(fig)
             except Exception as exc:
                 self.fft_status.setText(f"FFT error: {exc}")
+        self._apply_legend(fig)
         self._set_figure(fig)
         self._attach_cursors(fig)
         return True, None
 
     def _apply_trace_visibility(self, fig):
-        """Hide the Line2D artists for any trace in self._hidden_traces and drop
-        their legend entries. Trace plot order matches the packet's traces dict
-        order, so the i-th line on axis k is the i-th trace of axis k."""
+        """Hide the Line2D artists for any trace in self._hidden_traces. Trace
+        plot order matches the packet's traces dict order, so the i-th line on
+        axis k is the i-th trace of axis k. (Legend is handled separately.)"""
         if not self._hidden_traces:
             return
         try:
@@ -1685,20 +1763,11 @@ class FileTab(QWidget):
             for ax_idx, (ax_key, ax) in enumerate(axes.items()):
                 if ax_idx >= len(fig.axes):
                     break
-                mpl_ax = fig.axes[ax_idx]
-                lines = mpl_ax.get_lines()
+                lines = fig.axes[ax_idx].get_lines()
                 tr_keys = list((ax.get("traces", {}) or {}).keys())
                 for tr_idx, tr_key in enumerate(tr_keys):
                     if tr_idx < len(lines) and (ax_key, tr_key) in self._hidden_traces:
                         lines[tr_idx].set_visible(False)
-                # rebuild the legend from whatever remains visible
-                if mpl_ax.get_legend() is not None:
-                    keep = [ln for ln in mpl_ax.get_lines()
-                            if ln.get_visible() and not ln.get_label().startswith("_")]
-                    if keep:
-                        mpl_ax.legend(handles=keep, loc="best", fontsize="small")
-                    else:
-                        mpl_ax.get_legend().remove()
         except Exception:
             pass
 
@@ -1710,11 +1779,32 @@ class FileTab(QWidget):
             key = self._fit_result.get("ax_key")
             idx = ax_keys.index(key) if key in ax_keys else 0
             if idx < len(fig.axes):
-                ax = fig.axes[idx]
-                ax.plot(self._fit_result["x"], self._fit_result["y"],
-                        "--", color="#d1495b", linewidth=1.6,
-                        label=f"fit: {self._fit_result['label']}", zorder=10)
-                ax.legend(loc="best", fontsize="small")
+                fig.axes[idx].plot(
+                    self._fit_result["x"], self._fit_result["y"],
+                    "--", color="#d1495b", linewidth=1.6,
+                    label=f"fit: {self._fit_result['label']}", zorder=10)
+        except Exception:
+            pass
+
+    def _apply_legend(self, fig):
+        """Draw a legend on each axis from visible, named artists. graf itself
+        never creates legends, so this is what surfaces trace display names (and
+        the fit label); hidden traces are excluded."""
+        if not getattr(self, "legend_on", True):
+            return
+        try:
+            for ax in fig.axes:
+                handles, labels = [], []
+                for ln in ax.get_lines():
+                    lab = ln.get_label()
+                    if ln.get_visible() and lab and not lab.startswith("_"):
+                        handles.append(ln)
+                        labels.append(lab)
+                existing = ax.get_legend()
+                if handles:
+                    ax.legend(handles, labels, loc="best", fontsize="small")
+                elif existing is not None:
+                    existing.remove()
         except Exception:
             pass
 
@@ -1798,6 +1888,10 @@ class FileTab(QWidget):
         self.cursors_enabled = enabled
         if self.fig is not None:
             self._attach_cursors(self.fig)
+
+    def set_legend_on(self, enabled):
+        self.legend_on = enabled
+        self._show_current()
 
     def set_analysis_visible(self, visible):
         self.analysis_visible = visible
@@ -2047,6 +2141,7 @@ class OverlayTab(QWidget):
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 1)
         split.setSizes([820, 360])
+        self.split = split
         outer.addWidget(split, 1)
 
     def refresh(self, *args):
@@ -2112,20 +2207,25 @@ class OverlayTab(QWidget):
 
     def _do_replot(self):
         sel = self._iter_checked()
-        self._seq += 1
-        fig = plt.figure(f"overlay-{id(self)}-{self._seq}", figsize=(7.6, 5.0))
+        # A standalone Figure (not plt.figure) keeps this off pyplot's global
+        # state, which is what caused intermittent missing ticks/legend when it
+        # competed with the file tabs' pyplot figures.
+        fig = Figure(figsize=(7.6, 5.0))
         ax = fig.add_subplot(111)
         n = 0
         xlabel = ylabel = ""
         for tr in sel:
-            x, y = tr["x"], tr["y"]
+            x, y = tr.get("x", []), tr.get("y", [])
             m = min(len(x), len(y))
             if m == 0:
                 continue
             key = (tr["file"], tr["axis"], tr["trace"])
             kw = overlay_plot_kwargs(tr) if key in self._bring_format else {"linewidth": 1.3}
-            ax.plot(x[:m], y[:m],
-                    label=f"{tr['file']} · {tr['name'] or tr['trace']}", **kw)
+            label = f"{tr['file']} · {tr['name'] or tr['trace']}"
+            try:
+                ax.plot(x[:m], y[:m], label=label, **kw)
+            except Exception:
+                ax.plot(x[:m], y[:m], linewidth=1.3, label=label)   # bad stored fmt
             n += 1
             if not xlabel and tr.get("xlabel"):
                 xlabel = tr["xlabel"]
@@ -2135,9 +2235,14 @@ class OverlayTab(QWidget):
         ax.set_ylabel(ylabel or "Y")
         if self.grid_cb.isChecked():
             ax.grid(True, alpha=0.3)
-        if self.legend_cb.isChecked() and n:
-            ax.legend(loc="best", fontsize="small")
-        fig.tight_layout()
+        if self.legend_cb.isChecked():
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                ax.legend(handles, labels, loc="best", fontsize="small")
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
         self._set_figure(fig)
         nfiles = len(self.host.file_tabs())
         self.status.setText(f"{n} trace(s) overlaid from {nfiles} open file(s)")
@@ -2232,13 +2337,18 @@ class OverlayTab(QWidget):
                 return
             if hi <= lo:
                 hi = lo + 1.0
-            ticks = list(np.linspace(lo, hi, 6))
+            # nice round ticks within the data span (clipped so labels match)
+            ticks = [float(t) for t in MaxNLocator(nbins=6).tick_values(lo, hi)
+                     if lo - 1e-9 <= t <= hi + 1e-9]
+            if len(ticks) < 2:
+                ticks = list(np.linspace(lo, hi, 5))
+            pad = (hi - lo) * 0.05
             scale["is_valid"] = True
-            scale["val_min"] = lo - (hi - lo) * 0.05
-            scale["val_max"] = hi + (hi - lo) * 0.05
+            scale["val_min"] = lo - pad
+            scale["val_max"] = hi + pad
             scale["tick_list"] = ticks
             scale["minor_tick_list"] = []
-            scale["tick_label_list"] = [f"{t:.4g}" for t in ticks]
+            scale["tick_label_list"] = [f"{t:g}" for t in ticks]
 
         xb = bounds("x")
         yb = bounds("y")
@@ -2251,22 +2361,23 @@ class OverlayTab(QWidget):
             if w is not None:
                 w.setParent(None)
                 w.deleteLater()
-        if self.fig is not None:
-            try:
-                plt.close(self.fig)
-            except Exception:
-                pass
+        old = self.fig
         self.fig = fig
-        self.canvas = FigureCanvas(fig)
+        self.canvas = FigureCanvas(fig)        # standalone Figure: no pyplot manager
         toolbar = NavigationToolbar(self.canvas, self)
         self._plot_layout.addWidget(toolbar)
         self._plot_layout.addWidget(self.canvas)
         self.canvas.draw_idle()
+        if old is not None:
+            try:
+                old.clear()
+            except Exception:
+                pass
 
     def close_figure(self):
         if self.fig is not None:
             try:
-                plt.close(self.fig)
+                self.fig.clear()
             except Exception:
                 pass
             self.fig = None
@@ -2325,6 +2436,7 @@ class GrafExplorer(QMainWindow):
         self._sidebar_visible = s.value("sidebar_visible", True, type=bool)
         self._analysis_visible = s.value("analysis_visible", False, type=bool)
         self._cursors_enabled = s.value("cursors_enabled", True, type=bool)
+        self._legend_on = s.value("legend_on", True, type=bool)
 
     def _restore_geometry(self):
         geo = self.settings.value("geometry")
@@ -2411,6 +2523,11 @@ class GrafExplorer(QMainWindow):
         act_revert = editmenu.addAction("Revert to Original…")
         act_revert.triggered.connect(self._revert_current)
 
+        # Actions/menus that only make sense for a file tab (greyed out when a
+        # Comparison tab is active or no tab is open).
+        self._filetab_actions = [act_save, act_undo, act_redo, act_lock, act_revert]
+        self._filetab_menus = [export_fig, export_data]
+
         viewmenu = bar.addMenu("View")
 
         self._sidebar_action = viewmenu.addAction("Show Sidebar")
@@ -2429,6 +2546,11 @@ class GrafExplorer(QMainWindow):
         self._cursors_action.setCheckable(True)
         self._cursors_action.setChecked(self._cursors_enabled)
         self._cursors_action.toggled.connect(self._toggle_cursors)
+
+        self._legend_action = viewmenu.addAction("Show Legend")
+        self._legend_action.setCheckable(True)
+        self._legend_action.setChecked(self._legend_on)
+        self._legend_action.toggled.connect(self._toggle_legend)
         viewmenu.addSeparator()
 
         theme_menu = viewmenu.addMenu("Theme")
@@ -2508,11 +2630,37 @@ class GrafExplorer(QMainWindow):
         self.tabs.setTabToolTip(idx, str(path.resolve()))
         self.tabs.setCurrentIndex(idx)
         tab.modifiedChanged.connect(lambda t=tab: self._refresh_tab_text(t))
+        tab.legend_on = self._legend_on        # set before view setup re-renders
         tab.set_sidebar_visible(self._sidebar_visible)
         tab.set_cursors_enabled(self._cursors_enabled)
         tab.set_analysis_visible(self._analysis_visible)
+        tab.set_legend_on(self._legend_on)
+        self._restore_split("hsplit_sizes", tab.hsplit)
+        self._restore_split("sidebar_sizes", tab.sidebar)
+        tab.hsplit.splitterMoved.connect(
+            lambda *a, t=tab: self._save_split("hsplit_sizes", t.hsplit))
+        tab.sidebar.splitterMoved.connect(
+            lambda *a, t=tab: self._save_split("sidebar_sizes", t.sidebar))
         self._refresh_overlays()
+        self._update_menu_state()
         self._sync_view()
+
+    # -- splitter (panel tiling) persistence -----------------------------------
+    def _save_split(self, key, splitter):
+        sizes = splitter.sizes()
+        if any(sizes):
+            self.settings.setValue(key, ",".join(str(int(s)) for s in sizes))
+
+    def _restore_split(self, key, splitter):
+        raw = self.settings.value(key, "", type=str)
+        if not raw:
+            return
+        try:
+            sizes = [int(x) for x in raw.split(",") if x != ""]
+        except ValueError:
+            return
+        if sizes and len(sizes) == splitter.count():
+            splitter.setSizes(sizes)
 
     def file_tabs(self):
         """All open FileTabs, in tab order (used by comparison tabs)."""
@@ -2536,6 +2684,10 @@ class GrafExplorer(QMainWindow):
         tab = OverlayTab(self)
         idx = self.tabs.addTab(tab, "Comparison")
         self.tabs.setCurrentIndex(idx)
+        self._restore_split("overlay_sizes", tab.split)
+        tab.split.splitterMoved.connect(
+            lambda *a, t=tab: self._save_split("overlay_sizes", t.split))
+        self._update_menu_state()
         self._sync_view()
 
     def _save_current(self):
@@ -2601,6 +2753,14 @@ class GrafExplorer(QMainWindow):
             if isinstance(w, FileTab):
                 w.set_cursors_enabled(enabled)
 
+    def _toggle_legend(self, enabled):
+        self._legend_on = enabled
+        self.settings.setValue("legend_on", enabled)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_legend_on(enabled)
+
     def _refresh_tab_text(self, tab):
         idx = self.tabs.indexOf(tab)
         if idx >= 0:
@@ -2665,6 +2825,7 @@ class GrafExplorer(QMainWindow):
 
     def _sync_view(self):
         self.stack.setCurrentIndex(1 if self.tabs.count() else 0)
+        self._update_menu_state()
 
     def _on_tab_changed(self, index):
         tab = self.tabs.widget(index)
@@ -2672,6 +2833,15 @@ class GrafExplorer(QMainWindow):
             tab.refresh()                 # pick up edits made since last shown
         if getattr(tab, "canvas", None) is not None:
             QTimer.singleShot(0, tab.canvas.draw_idle)
+        self._update_menu_state()
+
+    def _update_menu_state(self):
+        """Enable file-only menu items only when a file tab is current."""
+        is_file = isinstance(self.tabs.currentWidget(), FileTab)
+        for act in getattr(self, "_filetab_actions", []):
+            act.setEnabled(is_file)
+        for menu in getattr(self, "_filetab_menus", []):
+            menu.setEnabled(is_file)
 
     # -- drag & drop -----------------------------------------------------------
     def dragEnterEvent(self, e):
