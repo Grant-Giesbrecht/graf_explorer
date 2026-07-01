@@ -651,6 +651,37 @@ def apply_default_trace_format(tr_dict, rgb):
     tr_dict["alpha"] = 1
 
 
+def rescale_axis_to_data(axis, xvals, yvals):
+    """Recompute a packed axis's X and left-Y Scale limits/ticks to span the
+    given data. graf's apply_to always forces the stored limits and ticks, so a
+    packet built from a template must have these refreshed or the data clips."""
+    def clean(vals):
+        out = [float(v) for v in vals
+               if isinstance(v, (int, float)) and np.isfinite(v)]
+        return (min(out), max(out)) if out else None
+
+    def write(scale, bounds):
+        if not isinstance(scale, dict) or bounds is None:
+            return
+        lo, hi = bounds
+        if hi <= lo:
+            hi = lo + 1.0
+        ticks = [float(t) for t in MaxNLocator(nbins=6).tick_values(lo, hi)
+                 if lo - 1e-9 <= t <= hi + 1e-9]
+        if len(ticks) < 2:
+            ticks = list(np.linspace(lo, hi, 5))
+        pad = (hi - lo) * 0.05
+        scale["is_valid"] = True
+        scale["val_min"] = lo - pad
+        scale["val_max"] = hi + pad
+        scale["tick_list"] = ticks
+        scale["minor_tick_list"] = []
+        scale["tick_label_list"] = [f"{t:g}" for t in ticks]
+
+    write(axis.get("x_axis"), clean(xvals))
+    write(axis.get("y_axis_L"), clean(yvals))
+
+
 # ── Analysis helpers (stats / FFT / curve fitting) ──────────────────────────────
 def trace_statistics(y):
     a = np.asarray(y, dtype=float)
@@ -936,6 +967,9 @@ class FileTab(QWidget):
         self.path = Path(path)
         self.fig = None
         self.canvas = None
+        self.fft_fig = None
+        self.fft_canvas = None
+        self._cursors = []
 
         self.locked = True
         self.modified = False
@@ -948,9 +982,8 @@ class FileTab(QWidget):
         self._undo_limit = 50
 
         # analysis / render state
-        self._fft_on = False              # show FFT axes below the main graph
+        self._fft_on = False              # show the separate FFT panel below
         self._fit_result = None           # dict(ax_key,x,y,label) or None
-        self._cursor = None
         self._hidden_traces = set()       # {(ax_key, tr_key)} hidden from the plot
         self.legend_on = True             # viewer-drawn legend (graf draws none)
         self.cursors_enabled = True
@@ -1025,8 +1058,29 @@ class FileTab(QWidget):
     # -- left: embedded matplotlib (rebuilt on every render) -------------------
     def _build_plot_panel(self):
         self._plot_container = QWidget()
-        self._plot_layout = QVBoxLayout(self._plot_container)
+        outer = QVBoxLayout(self._plot_container)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        # Main graph (top) and FFT (bottom) live in separate canvases inside a
+        # splitter, so the FFT panel can be dragged to any size and hidden when
+        # off. self._plot_layout / self._fft_layout host the toolbar + canvas.
+        self.plot_split = QSplitter(Qt.Vertical)
+
+        self._main_holder = QWidget()
+        self._plot_layout = QVBoxLayout(self._main_holder)
         self._plot_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_split.addWidget(self._main_holder)
+
+        self._fft_holder = QWidget()
+        self._fft_layout = QVBoxLayout(self._fft_holder)
+        self._fft_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_split.addWidget(self._fft_holder)
+        self._fft_holder.setVisible(False)
+
+        self.plot_split.setStretchFactor(0, 3)
+        self.plot_split.setStretchFactor(1, 1)
+        self.plot_split.setSizes([560, 240])
+        outer.addWidget(self.plot_split)
         return self._plot_container
 
     # -- left: analysis (stats / fit / FFT) -----------------------------------
@@ -1082,7 +1136,7 @@ class FileTab(QWidget):
         # FFT
         ft = QLabel("FFT"); ft.setObjectName("sectionHeader")
         v.addWidget(ft)
-        self.fft_check = QCheckBox("Show FFT below the graph")
+        self.fft_check = QCheckBox("Show FFT panel")
         self.fft_check.toggled.connect(self._on_fft_toggle)
         v.addWidget(self.fft_check)
         fftform = QFormLayout(); fftform.setContentsMargins(0, 0, 0, 0)
@@ -1096,6 +1150,9 @@ class FileTab(QWidget):
         self.fft_resample = QCheckBox("uniform resample")
         self.fft_resample.toggled.connect(self._on_fft_param_changed)
         fftform.addRow("", self.fft_resample)
+        self.fft_markers = QCheckBox("dotted line + markers")
+        self.fft_markers.toggled.connect(self._on_fft_param_changed)
+        fftform.addRow("", self.fft_markers)
         self.fft_from = QLineEdit(); self.fft_from.setValidator(QDoubleValidator())
         self.fft_from.setPlaceholderText("min")
         self.fft_from.editingFinished.connect(self._on_fft_param_changed)
@@ -1108,7 +1165,9 @@ class FileTab(QWidget):
         rng = QHBoxLayout(); rng.setContentsMargins(0, 0, 0, 0)
         self.fft_reset_btn = QPushButton("Full range"); self.fft_reset_btn.setObjectName("miniButton")
         self.fft_reset_btn.clicked.connect(self._reset_fft_range)
-        rng.addWidget(self.fft_reset_btn); rng.addStretch(1)
+        self.fft_export_btn = QPushButton("Export FFT → GrAF"); self.fft_export_btn.setObjectName("miniButton")
+        self.fft_export_btn.clicked.connect(self._export_fft_graf)
+        rng.addWidget(self.fft_reset_btn); rng.addWidget(self.fft_export_btn); rng.addStretch(1)
         v.addLayout(rng)
         self.fft_status = QLabel(""); self.fft_status.setObjectName("welcomeHint")
         self.fft_status.setWordWrap(True)
@@ -1173,7 +1232,8 @@ class FileTab(QWidget):
         self._reset_fft_range(rerender=False)
         self._update_stats()
         if self._fft_on:
-            self._show_current()
+            self._rebuild_fft()
+            self._attach_cursors()
 
     # -- curve fit -------------------------------------------------------------
     def _on_fit_model_changed(self, name):
@@ -1223,18 +1283,122 @@ class FileTab(QWidget):
 
     def _on_fft_toggle(self, on):
         self._fft_on = on
-        self._show_current()
+        if on:
+            self._rebuild_fft()
+            self._show_fft_holder(True)
+        else:
+            self._show_fft_holder(False)
+            self._clear_fft_figure()
+        self._attach_cursors()
 
     def _on_fft_param_changed(self, *_):
         if self._fft_on:
-            self._show_current()
+            self._rebuild_fft()
+            self._attach_cursors()
+
+    def _rebuild_fft(self):
+        """Rebuild only the FFT canvas (not the main graph)."""
+        try:
+            self._set_fft_figure(self._build_fft_figure())
+        except Exception as exc:
+            self.fft_status.setText(f"FFT error: {exc}")
+            self._show_fft_holder(False)
 
     def _reset_fft_range(self, rerender=True):
         self.fft_from.blockSignals(True); self.fft_to.blockSignals(True)
         self.fft_from.clear(); self.fft_to.clear()
         self.fft_from.blockSignals(False); self.fft_to.blockSignals(False)
         if rerender and self._fft_on:
-            self._show_current()
+            self._rebuild_fft()
+            self._attach_cursors()
+
+    def _export_fft_graf(self):
+        """Compute the current FFT and write it out as a new .graf file, then
+        open it as its own tab."""
+        item = self._current_analysis_trace()
+        if item is None:
+            self.fft_status.setText("Select a trace first.")
+            return
+        node = item["node"]
+        try:
+            freq, mag, info, uniform = compute_fft(
+                self._as_list(node, "x_data"), self._as_list(node, "y_data"),
+                window=self.fft_window.currentText(), db=self.fft_db.isChecked(),
+                xmin=self._fft_range()[0], xmax=self._fft_range()[1],
+                resample=self.fft_resample.isChecked())
+        except Exception as exc:
+            QMessageBox.warning(self, "FFT failed", f"Could not compute the FFT:\n\n{exc}")
+            return
+        try:
+            packet = self._build_fft_packet(freq, mag, item, uniform)
+        except Exception as exc:
+            QMessageBox.warning(self, "Could not build GrAF", str(exc))
+            return
+        host = self.window()
+        start = getattr(host, "_last_dir", "") or ""
+        default = os.path.join(start, f"{self.path.stem}_fft.graf")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export FFT as GrAF", default, "GrAF files (*.graf)")
+        if not path:
+            return
+        if not path.lower().endswith(".graf"):
+            path += ".graf"
+        try:
+            dict_to_tome(packet, path, show_detail=False)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed",
+                                 f"Could not write {os.path.basename(path)}:\n\n{exc}")
+            return
+        if hasattr(host, "_remember_dir"):
+            host._remember_dir(path)
+        if hasattr(host, "open_one"):
+            host.open_one(path)
+        self.fft_status.setText(f"Exported FFT → {os.path.basename(path)}")
+
+    def _build_fft_packet(self, freq, mag, item, uniform):
+        """Assemble a one-axis, one-trace GrAF packet holding the spectrum, using
+        the current file's structure as a template."""
+        base = copy.deepcopy(self.packet)
+        axes = base.get("axes", {}) or {}
+        if not axes:
+            raise RuntimeError("this file has no axes to use as a template")
+        ax_key = item.get("axis") if item.get("axis") in axes else next(iter(axes))
+        axis = axes[ax_key]
+        base["axes"] = {ax_key: axis}
+        src_traces = axis.get("traces", {}) or {}
+        template = src_traces.get(item.get("trace")) or next(iter(src_traces.values()), None)
+        if template is None:
+            raise RuntimeError("no template trace available to base the FFT on")
+        tr = copy.deepcopy(template)
+        axis["traces"] = {}
+        if "surfaces" in axis:
+            axis["surfaces"] = {}
+
+        tr["x_data"] = [float(f) for f in freq]
+        tr["y_data"] = [float(m) for m in mag]
+        tr["z_data"] = []
+        tr["use_yaxis_R"] = False
+        tr["display_name"] = f"FFT of {item['name'] or item['trace']}"
+        tr["include_in_legend"] = True
+        if self.fft_markers.isChecked():
+            tr["line_type"] = ":"; tr["marker_type"] = "."
+            tr["marker_size"] = 4; tr["line_width"] = 1
+        else:
+            tr["line_type"] = "-"; tr["marker_type"] = "None"; tr["line_width"] = 1.2
+        axis["traces"]["Tr0"] = tr
+
+        if isinstance(axis.get("x_axis"), dict):
+            axis["x_axis"]["label"] = "Frequency" + ("" if uniform else " (per sample)")
+        if isinstance(axis.get("y_axis_L"), dict):
+            axis["y_axis_L"]["label"] = "Magnitude (dB)" if self.fft_db.isChecked() else "Magnitude"
+        if isinstance(axis.get("y_axis_R"), dict):
+            axis["y_axis_R"]["is_valid"] = False
+        if "title" in axis:
+            axis["title"] = ""
+        if "supertitle" in base:
+            base["supertitle"] = "FFT"
+        rescale_axis_to_data(axis, freq, mag)
+        return base
 
     # -- right: structure + trace data ----------------------------------------
     def _build_sidebar(self):
@@ -1730,10 +1894,10 @@ class FileTab(QWidget):
         return ok, err
 
     def _show_current(self, graf=None):
-        """Render the main graph (with fit overlay), optionally adding an FFT
-        axes below it. Returns (ok, err); on a base-render failure the previous
-        figure is left in place. An FFT failure still shows the main graph and
-        reports the reason on the FFT status line."""
+        """Render the main graph into the top canvas. If the FFT panel is on,
+        render the spectrum into the separate (resizable) bottom canvas. Returns
+        (ok, err); a base-render failure keeps the previous figure, while an FFT
+        failure still shows the main graph and reports why on the FFT status."""
         g = graf if graf is not None else self.graf
         sanitize_graf_text(g)               # decode b'...' tick labels before draw
         try:
@@ -1742,14 +1906,19 @@ class FileTab(QWidget):
             return False, exc
         self._apply_trace_visibility(fig)
         self._apply_fit_overlay(fig)
-        if self._fft_on:
-            try:
-                self._augment_with_fft(fig)
-            except Exception as exc:
-                self.fft_status.setText(f"FFT error: {exc}")
         self._apply_legend(fig)
         self._set_figure(fig)
-        self._attach_cursors(fig)
+        if self._fft_on:
+            try:
+                self._set_fft_figure(self._build_fft_figure())
+                self._show_fft_holder(True)
+            except Exception as exc:
+                self.fft_status.setText(f"FFT error: {exc}")
+                self._show_fft_holder(False)
+        else:
+            self._show_fft_holder(False)
+            self._clear_fft_figure()
+        self._attach_cursors()
         return True, None
 
     def _apply_trace_visibility(self, fig):
@@ -1808,9 +1977,9 @@ class FileTab(QWidget):
         except Exception:
             pass
 
-    def _augment_with_fft(self, fig):
-        """Compress the existing (main) axes into the top band of the figure and
-        add an FFT axes in the bottom band, horizontally aligned with the main."""
+    def _build_fft_figure(self):
+        """Standalone Figure for the FFT panel (its own canvas, so it can be
+        resized independently of the main graph)."""
         item = self._current_analysis_trace()
         if item is None:
             raise ValueError("no trace selected for FFT")
@@ -1822,70 +1991,109 @@ class FileTab(QWidget):
             resample=self.fft_resample.isChecked())
         self.fft_status.setText(info)
 
+        fig = Figure(figsize=(6.0, 2.4))
+        ax = fig.add_subplot(111)
+        if self.fft_markers.isChecked():
+            ax.plot(freq, mag, linestyle=":", marker=".", markersize=4,
+                    linewidth=1.0, color="#4b89dc")
+        else:
+            ax.plot(freq, mag, linestyle="-", linewidth=1.2, color="#4b89dc")
+        ax.set_xlabel("Frequency" + ("" if uniform else " (per sample)"), fontsize="small")
+        ax.set_ylabel("Mag (dB)" if self.fft_db.isChecked() else "Mag", fontsize="small")
+        ax.set_title(f"FFT — {item['name'] or item['trace']}", fontsize="small")
+        ax.tick_params(labelsize="small")
+        ax.grid(True, alpha=0.3)
         try:
-            fig.set_constrained_layout(False)   # stop auto-layout from undoing us
+            fig.tight_layout()
         except Exception:
             pass
+        return fig
 
-        # horizontal extent to match the (first) main axes
-        if fig.axes:
-            p0 = fig.axes[0].get_position()
-            main_x0, main_w = p0.x0, p0.width
-        else:
-            main_x0, main_w = 0.125, 0.78
+    def _show_fft_holder(self, show):
+        was = self._fft_holder.isVisible()
+        self._fft_holder.setVisible(show)
+        if show and not was:                    # first reveal → give it real height
+            sizes = self.plot_split.sizes()
+            if len(sizes) == 2 and sizes[1] < 40:
+                total = sum(sizes) or 800
+                self.plot_split.setSizes([int(total * 0.68), int(total * 0.32)])
 
-        y_split = 0.40                          # main occupies [y_split, 1]
-        for ax in fig.axes:
-            pos = ax.get_position()
-            ax.set_position([pos.x0,
-                             y_split + pos.y0 * (1.0 - y_split),
-                             pos.width,
-                             pos.height * (1.0 - y_split)])
-
-        fft_ax = fig.add_axes([main_x0, 0.07, main_w, 0.21])
-        fft_ax.plot(freq, mag, color="#4b89dc", linewidth=1.2)
-        fft_ax.set_xlabel("Frequency" + ("" if uniform else " (per sample)"),
-                          fontsize="small")
-        fft_ax.set_ylabel("Mag (dB)" if self.fft_db.isChecked() else "Mag",
-                          fontsize="small")
-        fft_ax.set_title(f"FFT — {item['name'] or item['trace']}", fontsize="small")
-        fft_ax.tick_params(labelsize="small")
-        fft_ax.grid(True, alpha=0.3)
-
-    def _attach_cursors(self, fig):
-        # Always tear down the previous cursor first — otherwise disabling does
-        # nothing (the old mplcursors stays connected to the canvas).
-        if self._cursor is not None:
+    def _set_fft_figure(self, fig):
+        while self._fft_layout.count():
+            w = self._fft_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        old = self.fft_fig
+        self.fft_fig = fig
+        self.fft_canvas = FigureCanvas(fig)     # standalone Figure: no pyplot manager
+        self.fft_canvas.setAcceptDrops(False)
+        toolbar = NavigationToolbar(self.fft_canvas, self)
+        self._fft_layout.addWidget(toolbar)
+        self._fft_layout.addWidget(self.fft_canvas)
+        self.fft_canvas.draw_idle()
+        if old is not None:
             try:
-                self._cursor.remove()
+                old.clear()
             except Exception:
                 pass
-            self._cursor = None
+
+    def _clear_fft_figure(self):
+        while self._fft_layout.count():
+            w = self._fft_layout.takeAt(0).widget()
+            if w is not None:
+                w.setParent(None)
+                w.deleteLater()
+        if self.fft_fig is not None:
+            try:
+                self.fft_fig.clear()
+            except Exception:
+                pass
+        self.fft_fig = None
+        self.fft_canvas = None
+
+    def _attach_cursors(self):
+        # Tear down all previous cursors first — otherwise disabling does nothing
+        # and stale cursors linger on replaced canvases.
+        for c in self._cursors:
+            try:
+                c.remove()
+            except Exception:
+                pass
+        self._cursors = []
         if mplcursors is None or not self.cursors_enabled:
             return
+        figs = []
+        if self.fig is not None:
+            figs.append(self.fig)
+        if self._fft_on and self.fft_fig is not None:
+            figs.append(self.fft_fig)
+        for f in figs:
+            cur = self._make_cursor(f)
+            if cur is not None:
+                self._cursors.append(cur)
+
+    def _make_cursor(self, fig):
         try:
             lines = []
             for ax in fig.axes:
                 lines.extend(ax.get_lines())
             if not lines:
-                return
+                return None
             # Prefix datatips with the line's name when the plot has more than
-            # one labelled line — i.e. multiple traces, or a trace plus its fit.
-            # (The FFT line is unlabelled, so it never counts or shows a name.)
+            # one labelled line — multiple traces, or a trace plus its fit.
             named = [ln for ln in lines
                      if ln.get_label() and not ln.get_label().startswith("_")]
             multi = len(named) >= 2
 
-            # multiple=True → each click leaves a persistent datatip
-            # (right-click a datatip to remove it).
-            self._cursor = mplcursors.cursor(lines, hover=False, multiple=True)
+            cur = mplcursors.cursor(lines, hover=False, multiple=True)
 
-            @self._cursor.connect("add")
-            def _on_add(sel):
+            @cur.connect("add")
+            def _on_add(sel, _multi=multi):
                 line = sel.artist
-                # Snap to the nearest actual data vertex (mplcursors otherwise
-                # interpolates along the connecting segment). Compare in pixel
-                # space so differing X/Y scales don't bias the choice.
+                # Snap to the nearest actual data vertex (mplcursors interpolates
+                # along the segment otherwise). Compare in pixel space so the
+                # differing X/Y scales don't bias the choice.
                 x0, y0 = sel.target[0], sel.target[1]
                 try:
                     xd = np.asarray(line.get_xdata(), dtype=float)
@@ -1895,45 +2103,42 @@ class FileTab(QWidget):
                         tx, ty = line.axes.transData.transform((x0, y0))
                         i = int(np.argmin((pts[:, 0] - tx) ** 2 + (pts[:, 1] - ty) ** 2))
                         x0, y0 = float(xd[i]), float(yd[i])
-                        sel.annotation.xy = (x0, y0)     # point the arrow at the vertex
+                        sel.annotation.xy = (x0, y0)
                 except Exception:
                     pass
                 label = line.get_label() if line is not None else ""
                 prefix = ""
-                if multi and label and not str(label).startswith("_"):
+                if _multi and label and not str(label).startswith("_"):
                     prefix = f"{label}\n"
                 sel.annotation.set_text(f"{prefix}x = {x0:.6g}\ny = {y0:.6g}")
                 try:
                     sel.annotation.get_bbox_patch().set(alpha=0.9)
                 except Exception:
                     pass
+            return cur
         except Exception:
-            pass
+            return None
 
     def set_cursors_enabled(self, enabled):
         self.cursors_enabled = enabled
-        if self.fig is not None:
-            self._attach_cursors(self.fig)
+        self._attach_cursors()
 
     def set_legend_on(self, enabled):
         self.legend_on = enabled
         self._show_current()
 
     def apply_tight_layout(self):
-        """Re-fit the axes into the canvas. Plain tight_layout preserves any
-        zoom/pan; for the FFT-stacked layout we re-render instead, since
-        tight_layout would collapse the manual two-band positioning."""
-        if self.fig is None:
-            return
-        if self._fft_on:
-            self._show_current()
-            return
-        try:
-            self.fig.tight_layout()
-        except Exception:
-            pass
-        if self.canvas is not None:
-            self.canvas.draw_idle()
+        """Re-fit axes into each canvas (Ctrl+R). Preserves zoom/pan; the FFT
+        canvas is now independent, so no special-casing is needed."""
+        for f, c in ((self.fig, self.canvas), (self.fft_fig, self.fft_canvas)):
+            if f is None:
+                continue
+            try:
+                f.tight_layout()
+            except Exception:
+                pass
+            if c is not None:
+                c.draw_idle()
 
     def set_analysis_visible(self, visible):
         self.analysis_visible = visible
@@ -2096,6 +2301,12 @@ class FileTab(QWidget):
             except Exception:
                 pass
             self.fig = None
+        if self.fft_fig is not None:
+            try:
+                self.fft_fig.clear()
+            except Exception:
+                pass
+            self.fft_fig = None
 
 
 # ── Comparison / overlay tab ────────────────────────────────────────────────────
@@ -2358,44 +2569,14 @@ class OverlayTab(QWidget):
 
         # The stored Scale forces fixed limits/ticks on render, so recompute them
         # to span the combined data (otherwise traces from other files get clipped).
-        self._rescale_axis(axis, sel)
+        xs, ys = [], []
+        for e in sel:
+            xs.extend(e.get("x", []))
+            ys.extend(e.get("y", []))
+        rescale_axis_to_data(axis, xs, ys)
         if isinstance(axis.get("y_axis_R"), dict):
             axis["y_axis_R"]["is_valid"] = False
         return base
-
-    @staticmethod
-    def _rescale_axis(axis, sel):
-        def bounds(coord):
-            vals = []
-            for e in sel:
-                vals.extend(v for v in e.get(coord, [])
-                            if isinstance(v, (int, float)) and np.isfinite(v))
-            if not vals:
-                return None
-            return min(vals), max(vals)
-
-        def write(scale, lo, hi):
-            if not isinstance(scale, dict) or lo is None:
-                return
-            if hi <= lo:
-                hi = lo + 1.0
-            # nice round ticks within the data span (clipped so labels match)
-            ticks = [float(t) for t in MaxNLocator(nbins=6).tick_values(lo, hi)
-                     if lo - 1e-9 <= t <= hi + 1e-9]
-            if len(ticks) < 2:
-                ticks = list(np.linspace(lo, hi, 5))
-            pad = (hi - lo) * 0.05
-            scale["is_valid"] = True
-            scale["val_min"] = lo - pad
-            scale["val_max"] = hi + pad
-            scale["tick_list"] = ticks
-            scale["minor_tick_list"] = []
-            scale["tick_label_list"] = [f"{t:g}" for t in ticks]
-
-        xb = bounds("x")
-        yb = bounds("y")
-        write(axis.get("x_axis"), *(xb if xb else (None, None)))
-        write(axis.get("y_axis_L"), *(yb if yb else (None, None)))
 
     def _set_figure(self, fig):
         while self._plot_layout.count():
@@ -2693,10 +2874,13 @@ class GrafExplorer(QMainWindow):
         tab.set_legend_on(self._legend_on)
         self._restore_split("hsplit_sizes", tab.hsplit)
         self._restore_split("sidebar_sizes", tab.sidebar)
+        self._restore_split("plotsplit_sizes", tab.plot_split)
         tab.hsplit.splitterMoved.connect(
             lambda *a, t=tab: self._save_split("hsplit_sizes", t.hsplit))
         tab.sidebar.splitterMoved.connect(
             lambda *a, t=tab: self._save_split("sidebar_sizes", t.sidebar))
+        tab.plot_split.splitterMoved.connect(
+            lambda *a, t=tab: self._save_split("plotsplit_sizes", t.plot_split))
         self._refresh_overlays()
         self._update_menu_state()
         self._sync_view()
