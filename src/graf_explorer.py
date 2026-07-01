@@ -179,6 +179,7 @@ class Theme:
     border: str
     sel_bg: str
     sel_text: str
+    provenance: str = "#c8963e"     # colour for protected provenance tree rows
     ui_family: str = FONT_FAMILIES["Sans"]
     base_pt: int = 13
 
@@ -189,21 +190,21 @@ THEMES = {
         bg="#21252b", surface="#282c34", surface_alt="#2e333d",
         header_bg="#2f3540", accent="#4b89dc", accent_hover="#5d97e6",
         text="#e8eaed", subtext="#9aa0a6", border="#3a3f4b",
-        sel_bg="#3d5a80", sel_text="#ffffff",
+        sel_bg="#3d5a80", sel_text="#ffffff", provenance="#d1a054",
     ),
     "Daylight": Theme(
         name="Daylight",
         bg="#f4f6f8", surface="#ffffff", surface_alt="#eef1f5",
         header_bg="#e6eaf0", accent="#2f6fde", accent_hover="#1f5fce",
         text="#1b1f24", subtext="#5a626b", border="#d3d8df",
-        sel_bg="#cfe2ff", sel_text="#0b2545",
+        sel_bg="#cfe2ff", sel_text="#0b2545", provenance="#9a6b12",
     ),
     "Midnight": Theme(
         name="Midnight",
         bg="#1a1a2e", surface="#16213e", surface_alt="#1b2747",
         header_bg="#0f3460", accent="#e94560", accent_hover="#ff5b78",
         text="#eaeaea", subtext="#8888aa", border="#2a2a4a",
-        sel_bg="#e94560", sel_text="#ffffff",
+        sel_bg="#e94560", sel_text="#ffffff", provenance="#e0b354",
     ),
 }
 DEFAULT_THEME = "Graphite"
@@ -348,6 +349,30 @@ def load_graf_file(path) -> Graf:
     return g
 
 
+APP_NAME = "GrAF Explorer"
+APP_VERSION = "1.0"
+APP_ID = f"{APP_NAME} {APP_VERSION}"
+
+
+def write_packet_as_graf(packet, path, action=None, source_format=None):
+    """Write a packet to a .graf through Graf.write_graf so provenance is stamped
+    and the mutation history is updated. Returns the Graf (whose info now holds
+    the freshly stamped provenance/history) so the caller can sync it back into
+    an in-memory packet. Falls back to a raw tome write on older libraries."""
+    g = Graf()
+    g.unpack(copy.deepcopy(packet))
+    if hasattr(g, "write_graf"):
+        try:
+            g.write_graf(str(path), source_app=APP_ID, action=action,
+                         source_format=source_format)
+            return g
+        except TypeError:
+            g.write_graf(str(path))       # older write_graf without prov kwargs
+            return g
+    dict_to_tome(copy.deepcopy(packet), str(path), show_detail=False)
+    return g
+
+
 def deep_listify(obj):
     """Convert tuples to lists in-place throughout a packed dict, so every
     array element (e.g. an RGB colour) is mutable and therefore editable."""
@@ -440,6 +465,32 @@ def format_scalar(v) -> str:
         return "True" if v else "False"
     if isinstance(v, float):
         return FLOAT_FMT % v
+    return str(v)
+
+
+# Preferred display order for provenance fields (unknown keys follow, in order).
+_PROV_ORDER = [
+    "provenance_schema", "created_utc", "created_by", "created_by_app",
+    "graf_version", "source_language", "source_format", "source_filename",
+    "source_sha256", "creating_script", "hostname", "os_platform",
+    "machine_arch", "cpu_model",
+]
+
+
+def _fmt_meta_value(v) -> str:
+    """Human-readable one-line rendering of an info/provenance/condition value."""
+    v = _unwrap_scalar(v)
+    if isinstance(v, bytes):
+        try:
+            return v.decode("utf-8", "replace")
+        except Exception:
+            return repr(v)
+    if isinstance(v, float):
+        return FLOAT_FMT % v
+    if isinstance(v, (list, tuple)):
+        return ", ".join(_fmt_meta_value(x) for x in v)
+    if isinstance(v, dict):
+        return "{" + ", ".join(f"{k}: {_fmt_meta_value(x)}" for k, x in v.items()) + "}"
     return str(v)
 
 
@@ -974,7 +1025,7 @@ class FileTab(QWidget):
         self.locked = True
         self.modified = False
         self._building = False
-        self._invalid_items = set()
+        self._invalid_items = {}   # id(item) -> QTreeWidgetItem
         self._table_model = None
         self._current_is_trace = False
         self._undo_stack = []
@@ -988,6 +1039,12 @@ class FileTab(QWidget):
         self.legend_on = True             # viewer-drawn legend (graf draws none)
         self.cursors_enabled = True
         self.analysis_visible = False
+
+        # metadata / provenance state
+        self._provenance_color = "#c8963e"     # theme-driven; set by the window
+        self._allow_provenance_edits = False   # provenance is read-only by default
+        self.info_visible = False
+        self.provenance_visible = False
 
         # Packed dict is the single source of truth for edits, render, and save.
         self.packet = self.graf.pack()
@@ -1344,7 +1401,10 @@ class FileTab(QWidget):
         if not path.lower().endswith(".graf"):
             path += ".graf"
         try:
-            dict_to_tome(packet, path, show_detail=False)
+            write_packet_as_graf(packet, path,
+                                 action=f"FFT of '{item['name'] or item['trace']}' "
+                                        f"from {self.path.name}",
+                                 source_format="graf_explorer_fft")
         except Exception as exc:
             QMessageBox.critical(self, "Save failed",
                                  f"Could not write {os.path.basename(path)}:\n\n{exc}")
@@ -1495,12 +1555,158 @@ class FileTab(QWidget):
         if self.items:
             self._on_select(0)
 
+        info_panel = self._build_info_panel()
+        prov_panel = self._build_provenance_panel()
+
         side.addWidget(top)
         side.addWidget(bot)
+        side.addWidget(info_panel)
+        side.addWidget(prov_panel)
+        info_panel.setVisible(False)
+        prov_panel.setVisible(False)
+        self._info_panel = info_panel
+        self._prov_panel = prov_panel
         side.setStretchFactor(0, 1)
         side.setStretchFactor(1, 1)
         side.setSizes([380, 340])
         return side
+
+    # -- info / conditions panel ----------------------------------------------
+    def _build_info_panel(self):
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 4, 0, 0)
+        v.setSpacing(4)
+        hdr = QLabel("INFO"); hdr.setObjectName("sectionHeader")
+        v.addWidget(hdr)
+
+        v.addWidget(QLabel("Description"))
+        self.info_desc = QLabel("")
+        self.info_desc.setObjectName("welcomeHint")
+        self.info_desc.setWordWrap(True)
+        self.info_desc.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        v.addWidget(self.info_desc)
+
+        sub = QLabel("CONDITIONS"); sub.setObjectName("sectionHeader")
+        v.addWidget(sub)
+        self.cond_tree = QTreeWidget()
+        self.cond_tree.setColumnCount(2)
+        self.cond_tree.setHeaderLabels(["Key", "Value"])
+        self.cond_tree.setRootIsDecorated(False)
+        v.addWidget(self.cond_tree, 1)
+        return panel
+
+    # -- provenance panel ------------------------------------------------------
+    def _build_provenance_panel(self):
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 4, 0, 0)
+        v.setSpacing(4)
+        hdr = QLabel("PROVENANCE"); hdr.setObjectName("sectionHeader")
+        v.addWidget(hdr)
+
+        v.addWidget(QLabel("Creation"))
+        self.prov_tree = QTreeWidget()
+        self.prov_tree.setColumnCount(2)
+        self.prov_tree.setHeaderLabels(["Field", "Value"])
+        self.prov_tree.setRootIsDecorated(False)
+        self.prov_tree.setMaximumHeight(240)
+        v.addWidget(self.prov_tree)
+
+        v.addWidget(QLabel("Modification history"))
+        self.hist_tree = QTreeWidget()
+        self.hist_tree.setColumnCount(2)
+        self.hist_tree.setHeaderLabels(["Action", "When (UTC)"])
+        self.hist_tree.setRootIsDecorated(True)
+        v.addWidget(self.hist_tree, 1)
+        return panel
+
+    def _refresh_metadata(self):
+        """Repopulate the Info and Provenance panels from the current packet."""
+        if not hasattr(self, "cond_tree"):
+            return
+        info = self.packet.get("info") if isinstance(self.packet, dict) else None
+        info = info if isinstance(info, dict) else {}
+
+        desc = info.get("description", "")
+        self.info_desc.setText(str(desc) if str(desc).strip() else "(no description)")
+
+        self.cond_tree.clear()
+        conds = info.get("conditions")
+        if isinstance(conds, dict) and conds:
+            for k, val in conds.items():
+                QTreeWidgetItem(self.cond_tree, [str(k), _fmt_meta_value(val)])
+        else:
+            QTreeWidgetItem(self.cond_tree, ["(none)", ""])
+        self.cond_tree.resizeColumnToContents(0)
+
+        self.prov_tree.clear()
+        prov = info.get("provenance")
+        if isinstance(prov, dict) and prov:
+            keys = [k for k in _PROV_ORDER if k in prov] + \
+                   [k for k in prov if k not in _PROV_ORDER]
+            for k in keys:
+                QTreeWidgetItem(self.prov_tree, [str(k), _fmt_meta_value(prov[k])])
+        else:
+            QTreeWidgetItem(self.prov_tree, ["(not stamped yet)", ""])
+        self.prov_tree.resizeColumnToContents(0)
+
+        self.hist_tree.clear()
+        hist = info.get("history")
+        if isinstance(hist, list) and hist:
+            for i, entry in enumerate(hist):
+                if not isinstance(entry, dict):
+                    continue
+                top = QTreeWidgetItem(self.hist_tree, [
+                    f"{i + 1}. {entry.get('action', '?')}",
+                    str(entry.get("utc", ""))])
+                for k in ("by", "app", "content_sha256"):
+                    if k in entry:
+                        QTreeWidgetItem(top, [k, _fmt_meta_value(entry[k])])
+        else:
+            QTreeWidgetItem(self.hist_tree, ["(no history)", ""])
+        self.hist_tree.resizeColumnToContents(0)
+
+    def set_info_visible(self, visible):
+        self.info_visible = visible
+        if hasattr(self, "_info_panel"):
+            self._info_panel.setVisible(visible)
+            if visible:
+                self._refresh_metadata()
+
+    def set_provenance_visible(self, visible):
+        self.provenance_visible = visible
+        if hasattr(self, "_prov_panel"):
+            self._prov_panel.setVisible(visible)
+            if visible:
+                self._refresh_metadata()
+
+    def set_provenance_color(self, color):
+        self._provenance_color = color
+        if not hasattr(self, "tree"):
+            return
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if self._is_provenance_path(ch.data(0, Qt.UserRole)):
+                    self._color_provenance(ch)
+                walk(ch)
+        # setForeground emits itemChanged; guard it so recolouring is never
+        # mistaken for a user edit of a provenance row.
+        self._building = True
+        self.tree.blockSignals(True)
+        try:
+            for i in range(self.tree.topLevelItemCount()):
+                walk(self.tree.topLevelItem(i))
+        finally:
+            self.tree.blockSignals(False)
+            self._building = False
+
+    def set_allow_provenance_edits(self, allow):
+        self._allow_provenance_edits = allow
+        # rebuild the tree so editability flags on protected rows update
+        if hasattr(self, "tree"):
+            self._populate_structure()
 
     # -- structure tree --------------------------------------------------------
     def _populate_structure(self):
@@ -1524,21 +1730,44 @@ class FileTab(QWidget):
         for key, value in container.items():
             self._add_item(parent_item, str(key), value, path + [key])
 
+    @staticmethod
+    def _is_provenance_path(path):
+        """True for any node inside info/provenance or info/history."""
+        return (isinstance(path, list) and len(path) >= 2
+                and path[0] == "info" and path[1] in ("provenance", "history"))
+
+    def _color_provenance(self, item):
+        try:
+            brush = QBrush(QColor(self._provenance_color))
+            for c in range(4):
+                item.setForeground(c, brush)
+        except Exception:
+            pass
+
     def _add_item(self, parent, name, value, path):
         ttype, shape, disp = classify_value(value)
         item = QTreeWidgetItem(parent, [name, ttype, shape, disp])
         item.setData(0, Qt.UserRole, path)
+        protected = self._is_provenance_path(path)
+        if protected:
+            self._color_provenance(item)
         if ttype == "Group":
             self._build_node(item, value, path)
         elif ttype == "Dataset":
             if is_expandable_array(value):
                 for i, elem in enumerate(value):
+                    cpath = path + [i]
                     child = QTreeWidgetItem(item, [f"[{i}]", "item", "", format_scalar(elem)])
-                    child.setData(0, Qt.UserRole, path + [i])
-                    child.setFlags(child.flags() | Qt.ItemIsEditable)
+                    child.setData(0, Qt.UserRole, cpath)
+                    cprot = self._is_provenance_path(cpath)
+                    if cprot:
+                        self._color_provenance(child)
+                    if (not cprot) or self._allow_provenance_edits:
+                        child.setFlags(child.flags() | Qt.ItemIsEditable)
             # large / multi-dim arrays stay as a non-editable summary leaf
-        else:  # attr scalar — editable
-            item.setFlags(item.flags() | Qt.ItemIsEditable)
+        else:  # attr scalar — editable unless it's protected provenance
+            if (not protected) or self._allow_provenance_edits:
+                item.setFlags(item.flags() | Qt.ItemIsEditable)
         return item
 
     def _apply_attr_filter(self, *_):
@@ -1579,8 +1808,8 @@ class FileTab(QWidget):
         self._building = True
         try:
             name = item.text(0)
-            cont, last = self._resolve_container(path)
             try:
+                cont, last = self._resolve_container(path)
                 newv = coerce_like(cont[last], item.text(3))
             except Exception as exc:
                 self._mark_tree_invalid(item)
@@ -1596,6 +1825,8 @@ class FileTab(QWidget):
                 item.setToolTip(3, "")
                 self.struct_status.setText(f"✓ updated {name}")
                 item.setText(3, self._display_at(path))   # show normalized value
+                if isinstance(path, list) and path[:1] == ["info"]:
+                    self._refresh_metadata()              # keep Info/Prov panels live
             else:
                 self._mark_tree_invalid(item)
                 item.setToolTip(3, f"Edit applied but render failed: {err}")
@@ -1606,8 +1837,22 @@ class FileTab(QWidget):
     def _resolve_container(self, path):
         cont = self.packet
         for k in path[:-1]:
-            cont = cont[k]
-        return cont, path[-1]
+            if isinstance(cont, dict):
+                cont = cont[k]
+            elif isinstance(cont, (list, tuple)) and isinstance(k, int):
+                cont = cont[k]
+            else:
+                raise KeyError(f"cannot descend into {type(cont).__name__} at {k!r}")
+        last = path[-1]
+        if isinstance(cont, dict):
+            if last not in cont:
+                raise KeyError(last)
+        elif isinstance(cont, (list, tuple)):
+            if not (isinstance(last, int) and -len(cont) <= last < len(cont)):
+                raise KeyError(last)
+        else:
+            raise KeyError(f"{type(cont).__name__} is not editable at {last!r}")
+        return cont, last
 
     def _display_at(self, path):
         cont = self.packet
@@ -1619,11 +1864,12 @@ class FileTab(QWidget):
         self.tree.blockSignals(True)
         item.setForeground(3, QBrush(QColor(INVALID_RED)))
         self.tree.blockSignals(False)
-        self._invalid_items.add(item)
+        # keyed by id(): QTreeWidgetItem is unhashable in some PyQt5 builds
+        self._invalid_items[id(item)] = item
 
     def _clear_tree_invalids(self):
         self.tree.blockSignals(True)
-        for it in list(self._invalid_items):
+        for it in list(self._invalid_items.values()):
             try:
                 it.setForeground(3, QBrush())
             except RuntimeError:
@@ -1861,6 +2107,7 @@ class FileTab(QWidget):
             self._on_select(-1)
         self._fit_result = None
         self._refresh_analysis()
+        self._refresh_metadata()
         self._rerender_from_packet()
 
     # -- rendering -------------------------------------------------------------
@@ -2186,7 +2433,9 @@ class FileTab(QWidget):
         if not path.lower().endswith(".graf"):
             path += ".graf"
         try:
-            dict_to_tome(copy.deepcopy(self.packet), path, show_detail=False)
+            action = "edited in GrAF Explorer" if self.modified else None
+            g = write_packet_as_graf(self.packet, path, action=action)
+            self._sync_provenance_from_graf(g)
         except Exception as exc:
             QMessageBox.critical(self, "Save failed",
                                  f"Could not write {path}\n\n{exc}")
@@ -2194,7 +2443,20 @@ class FileTab(QWidget):
         self.path = Path(path)
         self.modified = False
         self.modifiedChanged.emit()
+        self._refresh_metadata()          # show the freshly appended history entry
         return True
+
+    def _sync_provenance_from_graf(self, g):
+        """Copy the provenance/history that write_graf just stamped onto `g` back
+        into the in-memory packet, so the metadata panels stay current."""
+        try:
+            info = self.packet.setdefault("info", {})
+            if hasattr(g, "info") and hasattr(g.info, "provenance"):
+                info["provenance"] = copy.deepcopy(g.info.provenance)
+            if hasattr(g, "info") and hasattr(g.info, "history"):
+                info["history"] = copy.deepcopy(g.info.history)
+        except Exception:
+            pass
 
     # -- exports ---------------------------------------------------------------
     _FIG_FORMATS = {
@@ -2521,7 +2783,9 @@ class OverlayTab(QWidget):
         if not path.lower().endswith(".graf"):
             path += ".graf"
         try:
-            dict_to_tome(copy.deepcopy(packet), path, show_detail=False)
+            write_packet_as_graf(packet, path,
+                                 action=f"comparison of {len(sel)} trace(s)",
+                                 source_format="graf_explorer_comparison")
         except Exception as exc:
             QMessageBox.critical(self, "Save failed",
                                  f"Could not write {os.path.basename(path)}:\n\n{exc}")
@@ -2670,6 +2934,9 @@ class GrafExplorer(QMainWindow):
         self._analysis_visible = s.value("analysis_visible", False, type=bool)
         self._cursors_enabled = s.value("cursors_enabled", True, type=bool)
         self._legend_on = s.value("legend_on", True, type=bool)
+        self._info_visible = s.value("info_visible", False, type=bool)
+        self._prov_visible = s.value("provenance_visible", False, type=bool)
+        self._allow_provenance_edits = False   # always start protected each session
 
     def _restore_geometry(self):
         geo = self.settings.value("geometry")
@@ -2756,10 +3023,17 @@ class GrafExplorer(QMainWindow):
         act_revert = editmenu.addAction("Revert to Original…")
         act_revert.triggered.connect(self._revert_current)
 
+        editmenu.addSeparator()
+        prov_menu = editmenu.addMenu("Provenance")
+        self._allow_prov_action = prov_menu.addAction("Allow Edits")
+        self._allow_prov_action.setCheckable(True)
+        self._allow_prov_action.setChecked(False)
+        self._allow_prov_action.toggled.connect(self._toggle_allow_provenance)
+
         # Actions/menus that only make sense for a file tab (greyed out when a
         # Comparison tab is active or no tab is open).
         self._filetab_actions = [act_save, act_undo, act_redo, act_lock, act_revert]
-        self._filetab_menus = [export_fig, export_data]
+        self._filetab_menus = [export_fig, export_data, prov_menu]
 
         viewmenu = bar.addMenu("View")
 
@@ -2784,6 +3058,16 @@ class GrafExplorer(QMainWindow):
         self._legend_action.setCheckable(True)
         self._legend_action.setChecked(self._legend_on)
         self._legend_action.toggled.connect(self._toggle_legend)
+
+        self._info_action = viewmenu.addAction("Show Info Panel")
+        self._info_action.setCheckable(True)
+        self._info_action.setChecked(self._info_visible)
+        self._info_action.toggled.connect(self._toggle_info_panel)
+
+        self._prov_action = viewmenu.addAction("Show Provenance Panel")
+        self._prov_action.setCheckable(True)
+        self._prov_action.setChecked(self._prov_visible)
+        self._prov_action.toggled.connect(self._toggle_provenance_panel)
 
         act_tight = viewmenu.addAction("Tight Layout")
         act_tight.setShortcut("Ctrl+R")
@@ -2817,6 +3101,11 @@ class GrafExplorer(QMainWindow):
     # -- theme -----------------------------------------------------------------
     def _apply_theme(self):
         QApplication.instance().setStyleSheet(build_stylesheet(self.theme))
+        if hasattr(self, "tabs"):
+            for i in range(self.tabs.count()):
+                w = self.tabs.widget(i)
+                if isinstance(w, FileTab):
+                    w.set_provenance_color(self.theme.provenance)
 
     def _set_theme(self, name):
         self.theme = replace(THEMES[name], ui_family=self.theme.ui_family,
@@ -2872,6 +3161,10 @@ class GrafExplorer(QMainWindow):
         tab.set_cursors_enabled(self._cursors_enabled)
         tab.set_analysis_visible(self._analysis_visible)
         tab.set_legend_on(self._legend_on)
+        tab.set_provenance_color(self.theme.provenance)
+        tab.set_allow_provenance_edits(self._allow_provenance_edits)
+        tab.set_info_visible(self._info_visible)
+        tab.set_provenance_visible(self._prov_visible)
         self._restore_split("hsplit_sizes", tab.hsplit)
         self._restore_split("sidebar_sizes", tab.sidebar)
         self._restore_split("plotsplit_sizes", tab.plot_split)
@@ -3000,6 +3293,42 @@ class GrafExplorer(QMainWindow):
             w = self.tabs.widget(i)
             if isinstance(w, FileTab):
                 w.set_legend_on(enabled)
+
+    def _toggle_info_panel(self, enabled):
+        self._info_visible = enabled
+        self.settings.setValue("info_visible", enabled)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_info_visible(enabled)
+
+    def _toggle_provenance_panel(self, enabled):
+        self._prov_visible = enabled
+        self.settings.setValue("provenance_visible", enabled)
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_provenance_visible(enabled)
+
+    def _toggle_allow_provenance(self, enabled):
+        if enabled:
+            resp = QMessageBox.warning(
+                self, "Allow editing provenance?",
+                "Provenance records where this file came from and what has "
+                "happened to it — it is meant to be a trustworthy, tamper-evident "
+                "archive.\n\nEditing it by hand can make the file misrepresent its "
+                "own history. Are you sure you want to allow provenance edits?",
+                QMessageBox.Yes | QMessageBox.Cancel, QMessageBox.Cancel)
+            if resp != QMessageBox.Yes:
+                self._allow_prov_action.blockSignals(True)
+                self._allow_prov_action.setChecked(False)
+                self._allow_prov_action.blockSignals(False)
+                return
+        self._allow_provenance_edits = enabled
+        for i in range(self.tabs.count()):
+            w = self.tabs.widget(i)
+            if isinstance(w, FileTab):
+                w.set_allow_provenance_edits(enabled)
 
     def _tight_layout_all(self):
         """Re-fit axes into the canvas for every open tab (Ctrl+R). Useful after
