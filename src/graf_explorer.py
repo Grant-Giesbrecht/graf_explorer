@@ -1043,8 +1043,7 @@ class FileTab(QWidget):
         # metadata / provenance state
         self._provenance_color = "#c8963e"     # theme-driven; set by the window
         self._allow_provenance_edits = False   # provenance is read-only by default
-        self.info_visible = False
-        self.provenance_visible = False
+        self.metadata_visible = False
 
         # Packed dict is the single source of truth for edits, render, and save.
         self.packet = self.graf.pack()
@@ -1062,11 +1061,15 @@ class FileTab(QWidget):
         self.hsplit.addWidget(self._build_plot_panel())
         self.sidebar = self._build_sidebar()
         self.hsplit.addWidget(self.sidebar)
+        self.metadata = self._build_metadata_panel()
+        self.hsplit.addWidget(self.metadata)
         self.hsplit.setStretchFactor(0, 0)
         self.hsplit.setStretchFactor(1, 3)
         self.hsplit.setStretchFactor(2, 2)
-        self.hsplit.setSizes([300, 760, 480])
+        self.hsplit.setStretchFactor(3, 0)
+        self.hsplit.setSizes([300, 760, 480, 320])
         self.analysis.setVisible(False)
+        self.metadata.setVisible(False)
         self._saved_split_sizes = None
         outer.addWidget(self.hsplit, 1)  # the splitter takes all extra vertical space
 
@@ -1555,17 +1558,8 @@ class FileTab(QWidget):
         if self.items:
             self._on_select(0)
 
-        info_panel = self._build_info_panel()
-        prov_panel = self._build_provenance_panel()
-
         side.addWidget(top)
         side.addWidget(bot)
-        side.addWidget(info_panel)
-        side.addWidget(prov_panel)
-        info_panel.setVisible(False)
-        prov_panel.setVisible(False)
-        self._info_panel = info_panel
-        self._prov_panel = prov_panel
         side.setStretchFactor(0, 1)
         side.setStretchFactor(1, 1)
         side.setSizes([380, 340])
@@ -1667,19 +1661,31 @@ class FileTab(QWidget):
             QTreeWidgetItem(self.hist_tree, ["(no history)", ""])
         self.hist_tree.resizeColumnToContents(0)
 
-    def set_info_visible(self, visible):
-        self.info_visible = visible
-        if hasattr(self, "_info_panel"):
-            self._info_panel.setVisible(visible)
-            if visible:
-                self._refresh_metadata()
+    def _build_metadata_panel(self):
+        """A dedicated, toggle-able panel holding the Info and Provenance views
+        in a vertical splitter (each independently resizable)."""
+        split = QSplitter(Qt.Vertical)
+        split.addWidget(self._build_info_panel())
+        split.addWidget(self._build_provenance_panel())
+        split.setStretchFactor(0, 1)
+        split.setStretchFactor(1, 1)
+        split.setSizes([300, 420])
+        self.metadata_split = split
+        return split
 
-    def set_provenance_visible(self, visible):
-        self.provenance_visible = visible
-        if hasattr(self, "_prov_panel"):
-            self._prov_panel.setVisible(visible)
-            if visible:
-                self._refresh_metadata()
+    def set_metadata_visible(self, visible):
+        self.metadata_visible = visible
+        if not hasattr(self, "metadata"):
+            return
+        self.metadata.setVisible(visible)
+        if visible:
+            sizes = self.hsplit.sizes()
+            if sizes and sizes[-1] < 50:        # first reveal → borrow from the plot
+                spare = sizes[1] + sizes[-1]
+                sizes[-1] = 320
+                sizes[1] = max(250, spare - 320)
+                self.hsplit.setSizes(sizes)
+            self._refresh_metadata()
 
     def set_provenance_color(self, color):
         self._provenance_color = color
@@ -2934,8 +2940,7 @@ class GrafExplorer(QMainWindow):
         self._analysis_visible = s.value("analysis_visible", False, type=bool)
         self._cursors_enabled = s.value("cursors_enabled", True, type=bool)
         self._legend_on = s.value("legend_on", True, type=bool)
-        self._info_visible = s.value("info_visible", False, type=bool)
-        self._prov_visible = s.value("provenance_visible", False, type=bool)
+        self._metadata_visible = s.value("metadata_visible", False, type=bool)
         self._allow_provenance_edits = False   # always start protected each session
 
     def _restore_geometry(self):
@@ -3059,15 +3064,11 @@ class GrafExplorer(QMainWindow):
         self._legend_action.setChecked(self._legend_on)
         self._legend_action.toggled.connect(self._toggle_legend)
 
-        self._info_action = viewmenu.addAction("Show Info Panel")
-        self._info_action.setCheckable(True)
-        self._info_action.setChecked(self._info_visible)
-        self._info_action.toggled.connect(self._toggle_info_panel)
-
-        self._prov_action = viewmenu.addAction("Show Provenance Panel")
-        self._prov_action.setCheckable(True)
-        self._prov_action.setChecked(self._prov_visible)
-        self._prov_action.toggled.connect(self._toggle_provenance_panel)
+        self._metadata_action = viewmenu.addAction("Show Metadata Panel")
+        self._metadata_action.setCheckable(True)
+        self._metadata_action.setChecked(self._metadata_visible)
+        self._metadata_action.setShortcut("Ctrl+Shift+I")
+        self._metadata_action.toggled.connect(self._toggle_metadata_panel)
 
         act_tight = viewmenu.addAction("Tight Layout")
         act_tight.setShortcut("Ctrl+R")
@@ -3163,8 +3164,7 @@ class GrafExplorer(QMainWindow):
         tab.set_legend_on(self._legend_on)
         tab.set_provenance_color(self.theme.provenance)
         tab.set_allow_provenance_edits(self._allow_provenance_edits)
-        tab.set_info_visible(self._info_visible)
-        tab.set_provenance_visible(self._prov_visible)
+        tab.set_metadata_visible(self._metadata_visible)
         self._restore_split("hsplit_sizes", tab.hsplit)
         self._restore_split("sidebar_sizes", tab.sidebar)
         self._restore_split("plotsplit_sizes", tab.plot_split)
@@ -3294,21 +3294,13 @@ class GrafExplorer(QMainWindow):
             if isinstance(w, FileTab):
                 w.set_legend_on(enabled)
 
-    def _toggle_info_panel(self, enabled):
-        self._info_visible = enabled
-        self.settings.setValue("info_visible", enabled)
+    def _toggle_metadata_panel(self, enabled):
+        self._metadata_visible = enabled
+        self.settings.setValue("metadata_visible", enabled)
         for i in range(self.tabs.count()):
             w = self.tabs.widget(i)
             if isinstance(w, FileTab):
-                w.set_info_visible(enabled)
-
-    def _toggle_provenance_panel(self, enabled):
-        self._prov_visible = enabled
-        self.settings.setValue("provenance_visible", enabled)
-        for i in range(self.tabs.count()):
-            w = self.tabs.widget(i)
-            if isinstance(w, FileTab):
-                w.set_provenance_visible(enabled)
+                w.set_metadata_visible(enabled)
 
     def _toggle_allow_provenance(self, enabled):
         if enabled:
