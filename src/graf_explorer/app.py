@@ -22,7 +22,7 @@ Theme and fonts are adjustable from the View menu.
 
 Requirements:
     pip install PyQt5 matplotlib numpy
-    plus your GrAF stack: graf, stardust, pylogfile, ganymede, colorama
+    plus your GrAF stack: graf, stardust, pylogfile, colorama
 """
 
 import os

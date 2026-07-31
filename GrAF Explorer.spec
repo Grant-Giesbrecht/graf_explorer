@@ -6,7 +6,6 @@ datas = [('src/graf_explorer/icons', 'icons')]
 binaries = []
 hiddenimports = ['PyQt5.sip']
 hiddenimports += collect_submodules('pylogfile')
-hiddenimports += collect_submodules('ganymede')
 hiddenimports += collect_submodules('colorama')
 tmp_ret = collect_all('graf')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

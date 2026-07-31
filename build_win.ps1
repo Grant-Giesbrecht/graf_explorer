@@ -108,7 +108,6 @@ $piArgs = @(
     '--collect-all', 'graf',
     '--collect-all', 'stardust',
     '--collect-submodules', 'pylogfile',
-    '--collect-submodules', 'ganymede',
     '--collect-submodules', 'colorama',
     '--hidden-import', 'PyQt5.sip',
     # The app uses PyQt5, but graf.widgets imports PyQt6 and --collect-all graf

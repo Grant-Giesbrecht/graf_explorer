@@ -41,7 +41,7 @@ for pkg in ("graf", "stardust"):
     hiddenimports += h
 
 # Pure-python deps that PyInstaller's static analysis can miss.
-for pkg in ("pylogfile", "ganymede", "colorama"):
+for pkg in ("pylogfile", "colorama"):
     hiddenimports += collect_submodules(pkg)
 
 hiddenimports += ["PyQt5.sip"]
