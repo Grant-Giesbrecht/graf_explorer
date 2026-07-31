@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "graf-explorer"
+version = "0.0.0"
+description = "A PyQt5 desktop viewer and editor for .graf data files."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Grant Giesbrecht", email = "giesbrechtgrant@gmail.com" }]
+keywords = ["graf", "plotting", "matplotlib", "pyqt", "data", "viewer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+dependencies = [
+    "numpy",
+    "matplotlib",
+    "PyQt5",
+    "graf-format",
+    "stardust-tools",
+]
+
+[project.urls]
+Homepage = "https://github.com/Grant-Giesbrecht/graf_explorer"
+Issues = "https://github.com/Grant-Giesbrecht/graf_explorer/issues"
+
+# GUI entry point: on Windows this produces a launcher with no console window.
+[project.gui-scripts]
+graf-explorer = "graf_explorer.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship only the runtime image assets -- not the .afdesign source, make_icns.sh,
+# or stray .DS_Store files that also live under icons/.
+[tool.setuptools.package-data]
+graf_explorer = [
+    "icons/*.png",
+    "icons/app/*.png",
+    "icons/app/*.ico",
+    "icons/app/*.icns",
+    "icons/file/*.png",
+    "icons/file/*.ico",
+    "icons/file/*.icns",
+]

@@ -13,7 +13,7 @@
       .\build_windows.ps1 -NoRegister           # just build, don't touch the registry
       .\build_windows.ps1 -InstallDir "$env:LOCALAPPDATA\Programs\GrAF Explorer"
 
-  Prereqs (in the SAME Python environment where `python src\graf_explorer.py` runs):
+  Prereqs (in the SAME Python environment where `python -m graf_explorer` runs):
       pip install pyinstaller pillow
 
   Icons
@@ -42,9 +42,9 @@ Set-Location -Path $PSScriptRoot
 
 $AppName = 'GrAF Explorer'
 $ProgId  = 'GrafExplorer.Document'
-$Entry   = 'src\graf_explorer.py'
-$AppIco  = 'icons\app\graf_app.ico'
-$DocIco  = 'icons\file\document.ico'
+$Entry   = 'src\graf_explorer\__main__.py'
+$AppIco  = 'src\graf_explorer\icons\app\graf_app.ico'
+$DocIco  = 'src\graf_explorer\icons\file\document.ico'
 
 function Resolve-IconSource {
     # Prefer a .png (cleanest), then .icns, sharing the target's basename.
@@ -111,9 +111,16 @@ $piArgs = @(
     '--collect-submodules', 'ganymede',
     '--collect-submodules', 'colorama',
     '--hidden-import', 'PyQt5.sip',
+    # The app uses PyQt5, but graf.widgets imports PyQt6 and --collect-all graf
+    # sweeps it in. PyInstaller refuses to bundle two Qt bindings, so exclude the
+    # unused bindings and the one graf module that pulls them (never imported here).
+    '--exclude-module', 'PyQt6',
+    '--exclude-module', 'PySide6',
+    '--exclude-module', 'PySide2',
+    '--exclude-module', 'graf.widgets',
     # Ship the icons folder so the in-app custom_icon_qss() can find sprites
     # (e.g. icons\tab_close.png) if you add them later. (; is the Windows sep.)
-    '--add-data', 'icons;icons'
+    '--add-data', 'src\graf_explorer\icons;icons'
 )
 if ($OneFile) { $piArgs += '--onefile' }
 $piArgs += $Entry

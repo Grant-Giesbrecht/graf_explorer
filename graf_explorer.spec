@@ -5,7 +5,7 @@
 #   pyinstaller graf_explorer.spec
 #
 # Run it from inside the Python environment that can already launch the app
-# (i.e. where `python src/graf_explorer.py` works and graf/stardust import cleanly).
+# (i.e. where `python -m graf_explorer` works and graf/stardust import cleanly).
 #
 # Icons
 #   * App icon      : icons/app/graf_app.icns   -> set on BUNDLE (the .app icon
@@ -20,12 +20,15 @@ import shutil
 
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-APP_ICON = 'icons/app/graf_app.icns'
-DOC_ICON = 'icons/file/document.icns'
+APP_ICON = 'src/graf_explorer/icons/app/graf_app.icns'
+DOC_ICON = 'src/graf_explorer/icons/file/document.icns'
 DOC_ICON_NAME = os.path.basename(DOC_ICON)        # 'document.icns'
 
 binaries, hiddenimports = [], []
-datas = []
+# Ship the icon assets so the app's resource_path() finds them at runtime (via
+# sys._MEIPASS/icons) for the window/taskbar icon and custom tab sprites. This
+# is separate from APP_ICON/DOC_ICON below, which are the .app and document icons.
+datas = [('src/graf_explorer/icons', 'icons')]
 
 # collect_all grabs submodules AND data files. graf ships its fonts and
 # portable_fonts.json under graf/assets/, which graf.base loads at import time --
@@ -54,7 +57,7 @@ EXCLUDES = ["PyQt6", "PySide6", "PySide2", "graf.widgets"]
 
 
 a = Analysis(
-    ['src/graf_explorer.py'],
+    ['src/graf_explorer/__main__.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,

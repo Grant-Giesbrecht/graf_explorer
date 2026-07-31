@@ -2,9 +2,9 @@
 # ============================================================
 #  Build "GrAF Explorer.app" for macOS with PyInstaller.
 #
-#  Run from the folder containing graf_explorer.py and
+#  Run from the folder containing src/graf_explorer/ and
 #  graf_explorer.spec, inside the Python environment where
-#  `python graf_explorer.py` already works.
+#  `python -m graf_explorer` already works.
 # ============================================================
 set -e
 
