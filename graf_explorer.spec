@@ -43,6 +43,15 @@ for pkg in ("pylogfile", "ganymede", "colorama"):
 
 hiddenimports += ["PyQt5.sip"]
 
+# This app uses PyQt5. However graf.widgets imports PyQt6, and collect_all("graf")
+# above sweeps in *every* graf submodule -- so PyQt6 gets pulled into the freeze
+# alongside PyQt5. PyInstaller refuses to bundle two Qt bindings, hence the
+# "attempt to collect multiple Qt bindings packages" abort. The app never imports
+# graf.widgets (graf.base pulls no graf submodules), so drop it and the other Qt
+# bindings entirely.
+hiddenimports = [h for h in hiddenimports if not h.startswith("graf.widgets")]
+EXCLUDES = ["PyQt6", "PySide6", "PySide2", "graf.widgets"]
+
 
 a = Analysis(
     ['src/graf_explorer.py'],
@@ -52,7 +61,7 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=[],
+    excludes=EXCLUDES,
     noarchive=False,
 )
 
