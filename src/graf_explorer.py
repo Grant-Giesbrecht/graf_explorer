@@ -78,7 +78,7 @@ except Exception:
 
 # ── GrAF stack ────────────────────────────────────────────────────────────────
 from graf.base import Graf
-from stardust.sandbox import dict_to_tome   # same import graf.base itself uses
+from stardust.tome import dict_to_tome   # same import graf.base itself uses
 
 
 # ── Theme system ───────────────────────────────────────────────────────────────
