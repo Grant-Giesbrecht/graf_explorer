@@ -13,8 +13,11 @@
       .\build_windows.ps1 -NoRegister           # just build, don't touch the registry
       .\build_windows.ps1 -InstallDir "$env:LOCALAPPDATA\Programs\GrAF Explorer"
 
-  Prereqs (in the SAME Python environment where `python -m graf_explorer` runs):
-      pip install pyinstaller pillow
+  Prereqs: just `python` on PATH. The script installs graf_explorer itself
+  (via `pip install -e .`, which pulls in numpy/matplotlib/PyQt5/graf-format/
+  stardust-tools per pyproject.toml) plus pyinstaller and pillow, so a
+  dependency missing from this environment fails loudly here instead of
+  producing an .exe that builds fine but crashes on launch.
 
   Icons
     Windows needs .ico files. This script builds them automatically, preferring a
@@ -79,25 +82,36 @@ img.save(sys.argv[2], format="ICO",
 
 # --- 0. sanity checks -----------------------------------------------------------
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-    throw "python not found on PATH. Activate the env where the app runs first."
-}
-if (-not (Get-Command pyinstaller -ErrorAction SilentlyContinue)) {
-    throw "pyinstaller not found. Run: pip install pyinstaller"
+    throw "python not found on PATH. Install Python 3 first."
 }
 if (-not (Test-Path $Entry)) { throw "Cannot find $Entry. Run this from the project root." }
 
-# --- 1. make sure we have .ico files (Windows can't use .icns/.png directly) ----
+# --- 1. install/refresh dependencies ---------------------------------------------
+# Use `python -m pip`/`python -m PyInstaller` (not bare `pip`/`pyinstaller`) so
+# everything resolves to the same interpreter as `python`, even if another
+# Python is also on PATH. Installing graf_explorer itself (-e .) pulls in its
+# full dependency set from pyproject.toml (numpy, matplotlib, PyQt5,
+# graf-format, stardust-tools) -- skipping this is how you get an .exe that
+# builds successfully but crashes on launch, because PyInstaller only bundles
+# what's already importable in this environment.
+Write-Host "==> Installing dependencies"
+& python -m pip install -e .
+if ($LASTEXITCODE -ne 0) { throw "pip install -e . failed (exit $LASTEXITCODE)." }
+& python -m pip install pyinstaller pillow
+if ($LASTEXITCODE -ne 0) { throw "Installing pyinstaller/pillow failed (exit $LASTEXITCODE)." }
+
+# --- 2. make sure we have .ico files (Windows can't use .icns/.png directly) ----
 Write-Host "==> Preparing icons"
 if (-not (Test-Path $AppIco)) { Convert-ToIco -Src (Resolve-IconSource $AppIco) -Dst $AppIco }
 if (-not (Test-Path $DocIco)) { Convert-ToIco -Src (Resolve-IconSource $DocIco) -Dst $DocIco }
 
-# --- 2. clean previous output ---------------------------------------------------
+# --- 3. clean previous output ---------------------------------------------------
 Write-Host "==> Cleaning old build/dist"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "build\$AppName"
 Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "dist\$AppName"
 Remove-Item -Force -ErrorAction SilentlyContinue "dist\$AppName.exe"
 
-# --- 3. build -------------------------------------------------------------------
+# --- 4. build -------------------------------------------------------------------
 Write-Host "==> Running PyInstaller"
 $piArgs = @(
     '--noconfirm', '--clean', '--windowed',
@@ -124,10 +138,10 @@ $piArgs = @(
 if ($OneFile) { $piArgs += '--onefile' }
 $piArgs += $Entry
 
-& pyinstaller @piArgs
+& python -m PyInstaller @piArgs
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed (exit $LASTEXITCODE)." }
 
-# --- 4. resolve build output, copy the document icon next to the exe -----------
+# --- 5. resolve build output, copy the document icon next to the exe -----------
 if ($OneFile) {
     $AppRoot = (Resolve-Path 'dist').Path
     $ExePath = Join-Path $AppRoot "$AppName.exe"
@@ -137,7 +151,7 @@ if ($OneFile) {
 }
 Copy-Item -Force $DocIco (Join-Path $AppRoot 'document.ico')
 
-# --- 5. optional: install to a stable location ---------------------------------
+# --- 6. optional: install to a stable location ---------------------------------
 if ($InstallDir) {
     Write-Host "==> Installing to $InstallDir"
     if (-not (Test-Path $InstallDir)) { New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null }
@@ -157,7 +171,7 @@ Write-Host ""
 Write-Host "Built:   $ExePath"
 Write-Host "DocIcon: $DocIconPath"
 
-# --- 6. register the .graf association + document icon (HKCU) -------------------
+# --- 7. register the .graf association + document icon (HKCU) -------------------
 if (-not $NoRegister) {
     Write-Host "==> Registering .graf for the current user"
     $classes = 'HKCU:\Software\Classes'

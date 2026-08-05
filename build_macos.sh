@@ -3,19 +3,33 @@
 #  Build "GrAF Explorer.app" for macOS with PyInstaller.
 #
 #  Run from the folder containing src/graf_explorer/ and
-#  graf_explorer.spec, inside the Python environment where
-#  `python -m graf_explorer` already works.
+#  graf_explorer.spec.
 # ============================================================
 set -e
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Make sure PyInstaller is available
-pip install pyinstaller
+# Use `python3 -m pip`/`python3 -m PyInstaller` everywhere instead of bare
+# `pip`/`pyinstaller`: those can resolve to a *different* Python install than
+# `python3` (shell aliases don't expand inside a script, and it's common to
+# have more than one Python on PATH), which would silently build against the
+# wrong site-packages.
+PYTHON=python3
+
+# Install/refresh graf_explorer's own runtime dependencies (numpy, matplotlib,
+# PyQt5, graf-format, stardust-tools -- see pyproject.toml) plus PyInstaller
+# itself. Skipping this is how you get a build that succeeds but crashes on
+# launch: PyInstaller only bundles what's already importable in this
+# environment, so a machine missing e.g. PyQt5 gets an app that silently
+# ships without it and dies at runtime with
+# "Failed to import any of the following Qt binding modules".
+"$PYTHON" -m pip install -e .
+"$PYTHON" -m pip install pyinstaller
 
 # Clean previous builds
 rm -rf build dist
 
 # Build using the spec (handles data files + Info.plist document type)
-pyinstaller graf_explorer.spec
+"$PYTHON" -m PyInstaller graf_explorer.spec
 
 echo
 echo "============================================================"
