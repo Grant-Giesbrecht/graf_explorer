@@ -22,7 +22,11 @@ classifiers = [
 ]
 dependencies = [
     "numpy",
-    "matplotlib",
+    # matplotlib>=3.11 introduced a new Qt toolbar icon engine
+    # (backend_qt._IconEngine) that renders oversized/clipped toolbar buttons
+    # on some macOS/Qt HiDPI configurations. Pin below it until that's fixed
+    # upstream.
+    "matplotlib<3.11",
     "PyQt5",
     # graf-format only ships pre-releases; naming .dev3 in the specifier lets
     # `pip install graf-explorer` pull it in without the user passing --pre.
