@@ -77,7 +77,7 @@ except Exception:
     _scipy_curve_fit = None
     _scipy_windows = None
 
-# Trace formatting dialog (line / marker / error-bar styling + colour picker).
+# Trace formatting dialog (line / marker / error-bar styling + color picker).
 try:
     from graf_explorer.style_dialog import (TraceStyleDialog, apply_themed_icon,
                                             set_icon_tint)
@@ -187,7 +187,7 @@ class Theme:
     border: str
     sel_bg: str
     sel_text: str
-    provenance: str = "#c8963e"     # colour for protected provenance tree rows
+    provenance: str = "#c8963e"     # color for protected provenance tree rows
     ui_family: str = FONT_FAMILIES["Sans"]
     base_pt: int = 13
 
@@ -330,7 +330,7 @@ QPushButton#lockButton {{
 }}
 QPushButton#lockButton:hover {{ background-color: {t.accent}; color: #ffffff; }}
 
-/* Square icon buttons (colour picker, per-row format buttons) */
+/* Square icon buttons (color picker, per-row format buttons) */
 QPushButton#iconButton {{
     background-color: {t.header_bg};
     color: {t.text};
@@ -435,7 +435,7 @@ def write_packet_as_graf(packet, path, action=None, source_format=None):
 
 def deep_listify(obj):
     """Convert tuples to lists in-place throughout a packed dict, so every
-    array element (e.g. an RGB colour) is mutable and therefore editable."""
+    array element (e.g. an RGB color) is mutable and therefore editable."""
     if isinstance(obj, dict):
         for k in list(obj.keys()):
             if isinstance(obj[k], tuple):
@@ -1875,7 +1875,7 @@ class FileTab(QWidget):
                 if self._is_provenance_path(ch.data(0, Qt.UserRole)):
                     self._color_provenance(ch)
                 walk(ch)
-        # setForeground emits itemChanged; guard it so recolouring is never
+        # setForeground emits itemChanged; guard it so recoloring is never
         # mistaken for a user edit of a provenance row.
         self._building = True
         self.tree.blockSignals(True)
@@ -2839,7 +2839,7 @@ class OverlayTab(QWidget):
         self.tree.itemChanged.connect(self._on_item_changed)
         cl.addWidget(self.tree, 1)
 
-        hint = QLabel("First box shows the trace · “Fmt” keeps its own colour/style "
+        hint = QLabel("First box shows the trace · “Fmt” keeps its own color/style "
                       "(off ⇒ default formatting) · double-click a “Legend entry” "
                       "to rename it (blank ⇒ automatic) · the last column's "
                       "button edits that trace's line / marker formatting.")
@@ -2941,7 +2941,7 @@ class OverlayTab(QWidget):
                 citem.setData(0, Qt.UserRole, tr)
                 citem.setCheckState(0, Qt.Checked if key in self._checked else Qt.Unchecked)
                 citem.setCheckState(1, Qt.Checked if key in self._bring_format else Qt.Unchecked)
-                citem.setToolTip(1, "Keep this trace's own colour / line style")
+                citem.setToolTip(1, "Keep this trace's own color / line style")
                 citem.setToolTip(LEGEND_COL, "Double-click to rename this legend "
                                              "entry (clear it for the automatic one)")
                 btn = QPushButton()
@@ -2958,7 +2958,7 @@ class OverlayTab(QWidget):
 
     def _trace_index(self, tr):
         """Position of a trace among the checked ones (drives the default
-        colour, so a trace keeps the colour it has in the plot)."""
+        color, so a trace keeps the color it has in the plot)."""
         key = self._key(tr)
         for i, e in enumerate(self._iter_checked()):
             if self._key(e) == key:
@@ -2991,15 +2991,26 @@ class OverlayTab(QWidget):
     def _open_style_dialog(self, tr):
         """Per-trace format editor, opened from the button on its row."""
         key = self._key(tr)
-        entry = {"key": key,
-                 "label": self._label_for(tr),
-                 "style": self._effective_style(tr)}
+        style = self._effective_style(tr)
+        # The dialog's name box edits this overlay's legend entry — the same
+        # text as the "Legend entry" column.
+        style["display_name"] = self._label_for(tr)
+        entry = {"key": key, "label": self._label_for(tr), "style": style}
 
         had_override = key in self._styles
         previous = dict(self._styles[key]) if had_override else None
+        had_label = key in self._labels
+        previous_label = self._labels.get(key)
 
         def apply(styles):
-            self._styles[key] = dict(styles[key])
+            st = dict(styles[key])
+            name = str(st.pop("display_name", "") or "").strip()
+            if name and name != self._auto_label(tr):
+                self._labels[key] = name
+            else:
+                self._labels.pop(key, None)   # blank / unchanged ⇒ automatic
+            self._styles[key] = st
+            self._refresh_legend_column()
             self._do_replot()
 
         dlg = TraceStyleDialog([entry], self, on_apply=apply,
@@ -3009,6 +3020,11 @@ class OverlayTab(QWidget):
                 self._styles[key] = previous
             else:
                 self._styles.pop(key, None)    # back to Fmt / default formatting
+            if had_label:
+                self._labels[key] = previous_label
+            else:
+                self._labels.pop(key, None)
+            self._refresh_legend_column()
             self._do_replot()
 
     def _reset_styles(self):

@@ -3,11 +3,11 @@
 Trace formatting dialogs
 ========================
 Reusable Qt dialogs for editing a GrAF trace's line / marker / error-bar
-formatting, plus the colour picker they hang off.
+formatting, plus the color picker they hang off.
 
     ColorPickerDialog   HSL / RGB / HSV / swatch tabs, live preview, copyable
                         hex + rgb readouts.
-    ColorField          one-line colour editor: text box (hex, CSS name,
+    ColorField          one-line color editor: text box (hex, CSS name,
                         "r,g,b", "rgb(...)") + a palette button opening the
                         picker, with a swatch preview.
     TraceStyleDialog    the format editor. One trace ⇒ a plain form; several
@@ -60,7 +60,7 @@ MARKER_TYPE_LABELS = {
     "None": "(none)",
 }
 
-# Swatch tab: matplotlib's default cycle followed by common plain colours.
+# Swatch tab: matplotlib's default cycle followed by common plain colors.
 SWATCHES = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
@@ -72,8 +72,8 @@ SWATCHES = [
 
 
 # ── themed icons ───────────────────────────────────────────────────────────────
-# icons/*.png are single-colour glyphs on transparency, so they are re-tinted to
-# the active theme's text colour. Buttons carrying one register here and are
+# icons/*.png are single-color glyphs on transparency, so they are re-tinted to
+# the active theme's text color. Buttons carrying one register here and are
 # re-tinted when the theme changes.
 _icon_tint = "#e8eaed"
 _icon_buttons = []          # weakrefs to buttons showing a themed icon
@@ -96,7 +96,7 @@ def icon_path(name):
 
 
 def tinted_icon(name, color=None, size=18):
-    """The named icon recoloured to `color` (the current theme tint by default)."""
+    """The named icon recolored to `color` (the current theme tint by default)."""
     path = icon_path(name)
     if not path:
         return QIcon()
@@ -141,7 +141,7 @@ def set_icon_tint(color):
     _icon_buttons[:] = live
 
 
-# ── colour conversion helpers ──────────────────────────────────────────────────
+# ── color conversion helpers ──────────────────────────────────────────────────
 def clamp01(v):
     return 0.0 if v < 0 else (1.0 if v > 1 else float(v))
 
@@ -156,9 +156,9 @@ def rgb_to_255(rgb):
 
 
 def parse_color(text, default=None):
-    """Parse a colour written as hex (#rgb/#rrggbb), a CSS/matplotlib name,
+    """Parse a color written as hex (#rgb/#rrggbb), a CSS/matplotlib name,
     "r,g,b" (0-255 ints or 0-1 floats) or "rgb(r,g,b)". Returns an (r,g,b)
-    float triple, or `default` if the text is not a colour."""
+    float triple, or `default` if the text is not a color."""
     if text is None:
         return default
     s = str(text).strip()
@@ -180,7 +180,7 @@ def parse_color(text, default=None):
                 return tuple(vals)                      # already 0-1 floats
             if all(0.0 <= v <= 255.0 for v in vals):
                 return tuple(v / 255.0 for v in vals)
-    # Hex and named colours: matplotlib knows the most names, Qt is the backup.
+    # Hex and named colors: matplotlib knows the most names, Qt is the backup.
     try:
         from matplotlib.colors import to_rgb
         return tuple(float(c) for c in to_rgb(s))
@@ -193,7 +193,7 @@ def parse_color(text, default=None):
 
 
 def color_from_style(value, default=(0.0, 0.0, 0.0)):
-    """Coerce a packed trace's colour field (list/tuple of floats, or a string)
+    """Coerce a packed trace's color field (list/tuple of floats, or a string)
     into an (r,g,b) float triple."""
     if isinstance(value, (list, tuple)) and len(value) >= 3:
         try:
@@ -206,7 +206,7 @@ def color_from_style(value, default=(0.0, 0.0, 0.0)):
 
 
 class _Swatch(QLabel):
-    """Flat colour chip."""
+    """Flat color chip."""
 
     def __init__(self, rgb=(0, 0, 0), w=44, h=22, parent=None):
         super().__init__(parent)
@@ -245,7 +245,7 @@ def add_accept_shortcuts(dialog, slot):
         QShortcut(QKeySequence(seq), dialog, activated=slot)
 
 
-# ── colour picker ──────────────────────────────────────────────────────────────
+# ── color picker ──────────────────────────────────────────────────────────────
 class _SliderRow(QWidget):
     """Slider + spin box locked together, reported in 0-1 regardless of range."""
 
@@ -303,10 +303,10 @@ class _SliderRow(QWidget):
 
 
 class ColorPickerDialog(_NoDefaultButtonDialog):
-    """Pick a colour by HSL, RGB, HSV or swatch, with a live preview and
+    """Pick a color by HSL, RGB, HSV or swatch, with a live preview and
     copyable hex / rgb readouts."""
 
-    def __init__(self, rgb=(0, 0, 0), parent=None, title="Choose colour"):
+    def __init__(self, rgb=(0, 0, 0), parent=None, title="Choose color"):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setModal(True)
@@ -494,13 +494,13 @@ class ColorPickerDialog(_NoDefaultButtonDialog):
         self.set_rgb(self._start_rgb)
 
 
-# ── colour field ───────────────────────────────────────────────────────────────
+# ── color field ───────────────────────────────────────────────────────────────
 class ColorField(QWidget):
     """Text box (hex / name / r,g,b) + swatch + picker button."""
 
     colorChanged = pyqtSignal(tuple)
 
-    def __init__(self, rgb=(0, 0, 0), parent=None, label="colour"):
+    def __init__(self, rgb=(0, 0, 0), parent=None, label="color"):
         super().__init__(parent)
         self._rgb = color_from_style(rgb)
         self._label = label
@@ -509,13 +509,13 @@ class ColorField(QWidget):
         h.setSpacing(4)
         self.swatch = _Swatch(self._rgb, w=26, h=22)
         self.edit = QLineEdit(rgb_to_hex(self._rgb))
-        self.edit.setToolTip("#rrggbb, a colour name, or r,g,b")
+        self.edit.setToolTip("#rrggbb, a color name, or r,g,b")
         self.edit.editingFinished.connect(self._from_text)
         self.btn = QPushButton()
         self.btn.setObjectName("iconButton")
         self.btn.setFixedSize(30, 24)
         apply_themed_icon(self.btn, "color.png", size=15)
-        self.btn.setToolTip("Open the colour picker")
+        self.btn.setToolTip("Open the color picker")
         self.btn.clicked.connect(self._open_picker)
         h.addWidget(self.swatch)
         h.addWidget(self.edit, 1)
@@ -570,6 +570,14 @@ class TraceStyleForm(QWidget):
         v = QVBoxLayout(self)
         v.setContentsMargins(2, 2, 2, 2)
 
+        name_box = QGroupBox("Trace")
+        nf = QFormLayout(name_box)
+        self.display_name = QLineEdit()
+        self.display_name.setPlaceholderText("(unnamed)")
+        self.display_name.setToolTip("The trace's display name — its legend entry")
+        nf.addRow("Name", self.display_name)
+        v.addWidget(name_box)
+
         line_box = QGroupBox("Line")
         lf = QFormLayout(line_box)
         self.line_type = QComboBox()
@@ -578,8 +586,8 @@ class TraceStyleForm(QWidget):
         lf.addRow("Style", self.line_type)
         self.line_width = self._spin(0.0, 30.0, 0.1, 2)
         lf.addRow("Width", self.line_width)
-        self.line_color = ColorField(label="line colour")
-        lf.addRow("Colour", self.line_color)
+        self.line_color = ColorField(label="line color")
+        lf.addRow("Color", self.line_color)
         self.alpha = self._spin(0.0, 1.0, 0.05, 2)
         lf.addRow("Alpha", self.alpha)
         v.addWidget(line_box)
@@ -592,22 +600,22 @@ class TraceStyleForm(QWidget):
         mf.addRow("Style", self.marker_type)
         self.marker_size = self._spin(0.0, 60.0, 0.5, 2)
         mf.addRow("Size", self.marker_size)
-        self.marker_color = ColorField(label="marker colour")
-        mf.addRow("Colour", self.marker_color)
+        self.marker_color = ColorField(label="marker color")
+        mf.addRow("Color", self.marker_color)
         v.addWidget(mk_box)
 
         self.err_box = QGroupBox("Error bars")
         ef = QFormLayout(self.err_box)
         self.err_cap_visible = QCheckBox("show caps")
         ef.addRow("", self.err_cap_visible)
-        self.err_line_color = ColorField(label="error bar colour")
-        ef.addRow("Bar colour", self.err_line_color)
+        self.err_line_color = ColorField(label="error bar color")
+        ef.addRow("Bar color", self.err_line_color)
         self.err_line_width = self._spin(0.0, 30.0, 0.1, 2)
         ef.addRow("Bar width", self.err_line_width)
         self.err_cap_size = self._spin(0.0, 60.0, 0.5, 2)
         ef.addRow("Cap size", self.err_cap_size)
-        self.err_cap_color = ColorField(label="cap colour")
-        ef.addRow("Cap colour", self.err_cap_color)
+        self.err_cap_color = ColorField(label="cap color")
+        ef.addRow("Cap color", self.err_cap_color)
         self.err_cap_width = self._spin(0.0, 30.0, 0.1, 2)
         ef.addRow("Cap width", self.err_cap_width)
         v.addWidget(self.err_box)
@@ -624,6 +632,8 @@ class TraceStyleForm(QWidget):
         for name in ("line_color", "marker_color", "err_line_color", "err_cap_color"):
             getattr(self, name).colorChanged.connect(self._emit_changed)
         self.err_cap_visible.toggled.connect(self._emit_changed)
+        # textEdited (not textChanged) so set_style() loading a name is silent.
+        self.display_name.textEdited.connect(self._emit_changed)
 
     @staticmethod
     def _spin(lo, hi, step, decimals):
@@ -644,6 +654,7 @@ class TraceStyleForm(QWidget):
         self._guard = True
         self._style = dict(style or {})
         s = self._style
+        self.display_name.setText(str(s.get("display_name", "") or ""))
         self._select(self.line_type, s.get("line_type", "-"), LINE_TYPES)
         self._select(self.marker_type, s.get("marker_type", "None"), MARKER_TYPES)
         for name, default in self.SIZE_FIELDS:
@@ -676,6 +687,7 @@ class TraceStyleForm(QWidget):
         """The edited formatting, as packed-trace fields. Error-bar fields are
         only included when the trace actually has error bars."""
         out = {
+            "display_name": self.display_name.text(),
             "line_type": self.line_type.currentData(),
             "line_width": self.line_width.value(),
             "line_color": list(self.line_color.rgb()),
@@ -725,7 +737,7 @@ class TraceStyleDialog(_NoDefaultButtonDialog):
         self._apply_timer.setInterval(120)
         self._apply_timer.timeout.connect(self.apply)
         self._build_ui()
-        self.resize(430, 620)
+        self.resize(430, 700)      # tall enough for the error-bar group; scrolls below that
 
     def _build_ui(self):
         v = QVBoxLayout(self)
@@ -774,9 +786,13 @@ class TraceStyleDialog(_NoDefaultButtonDialog):
         area.setWidget(widget)
         return area
 
+    # Fields that are per-trace identity rather than formatting, so "Copy to
+    # all" must leave them alone.
+    NOT_COPYABLE = ("display_name",)
+
     def _copy_to_all(self):
         """Push the visible tab's settings onto every other trace, keeping each
-        trace's own error-bar applicability."""
+        trace's own name and error-bar applicability."""
         if self.tabs is None:
             return
         keys = list(self._forms)
@@ -787,8 +803,9 @@ class TraceStyleDialog(_NoDefaultButtonDialog):
                 continue
             merged = form.base_style()
             merged.update({k: v for k, v in src.items()
-                           if merged.get("has_error_bars")
-                           or not k.startswith("err_")})
+                           if k not in self.NOT_COPYABLE
+                           and (merged.get("has_error_bars")
+                                or not k.startswith("err_"))})
             form.set_style(merged)
         self._schedule_apply()
 
