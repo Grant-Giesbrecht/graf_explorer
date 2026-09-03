@@ -1114,6 +1114,11 @@ class TraceTableModel(QAbstractTableModel):
 
 
 # ── A tab: one file = lock bar + plot + sidebar ─────────────────────────────────
+FORMAT_BTN_TIP = ("Edit line / marker / error-bar formatting for every trace "
+                  "in this file")
+FORMAT_BTN_TIP_LOCKED = "Unlock the file to edit trace formatting"
+
+
 class FileTab(QWidget):
     _n_created = 0
     modifiedChanged = pyqtSignal()
@@ -1222,8 +1227,7 @@ class FileTab(QWidget):
         self.format_btn.setObjectName("miniButton")
         self.format_btn.setFixedHeight(28)
         apply_themed_icon(self.format_btn, "format.png", size=15)
-        self.format_btn.setToolTip("Edit line / marker / error-bar formatting "
-                                   "for every trace in this file")
+        self.format_btn.setToolTip(FORMAT_BTN_TIP)
         self.format_btn.clicked.connect(self.open_format_dialog)
 
         h.addWidget(self.lock_btn)
@@ -1238,7 +1242,11 @@ class FileTab(QWidget):
 
     # -- trace formatting ------------------------------------------------------
     def open_format_dialog(self):
-        """Tabbed format editor over every trace in this file."""
+        """Tabbed format editor over every trace in this file. Formatting is an
+        edit to the file, so it follows the same lock as the tree and table."""
+        if self.locked:
+            self.struct_status.setText("Unlock the file to edit formatting")
+            return
         traces = [it for it in enumerate_data_items(self.packet)
                   if it["kind"] == "trace"]
         if not traces:
@@ -2205,6 +2213,8 @@ class FileTab(QWidget):
             if editable_table else QAbstractItemView.NoEditTriggers)
         self.add_btn.setEnabled(editable_table)
         self.del_btn.setEnabled(editable_table)
+        self.format_btn.setEnabled(not locked)
+        self.format_btn.setToolTip(FORMAT_BTN_TIP_LOCKED if locked else FORMAT_BTN_TIP)
 
     # -- undo / redo / revert --------------------------------------------------
     def _snapshot(self):
