@@ -98,6 +98,17 @@ Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "dist\$AppName"
 Remove-Item -Force -ErrorAction SilentlyContinue "dist\$AppName.exe"
 
 # --- 3. build -------------------------------------------------------------------
+# graf and stardust are editable installs that PyInstaller's static analysis can
+# fail to locate, which silently drops *their* dependencies (e.g. cryptography,
+# pulled in only by stardust.io) from the bundle -- the frozen app then dies on
+# launch with a bare ModuleNotFoundError. build_support.py resolves the dirs that
+# have to go on the search path; see it for the full explanation.
+Write-Host "==> Resolving editable-install paths"
+$PkgPaths = @(& python build_support.py)
+if ($LASTEXITCODE -ne 0) { throw "build_support.py failed (exit $LASTEXITCODE)." }
+$PkgPaths = $PkgPaths | Where-Object { $_ -and $_.Trim() }
+foreach ($p in $PkgPaths) { Write-Host "  $p" }
+
 Write-Host "==> Running PyInstaller"
 $piArgs = @(
     '--noconfirm', '--clean', '--windowed',
@@ -110,6 +121,12 @@ $piArgs = @(
     '--collect-submodules', 'pylogfile',
     '--collect-submodules', 'colorama',
     '--hidden-import', 'PyQt5.sip',
+    # Reached only through graf/stardust, so absent from this app's own import
+    # graph. --paths below should surface them anyway; naming them explicitly
+    # means a future editable-install quirk degrades into a bigger bundle
+    # rather than a crash. Keep in sync via build_support.EXTRA_HIDDEN_IMPORTS.
+    '--hidden-import', 'cryptography',
+    '--hidden-import', 'h5py',
     # The app uses PyQt5, but graf.widgets imports PyQt6 and --collect-all graf
     # sweeps it in. PyInstaller refuses to bundle two Qt bindings, so exclude the
     # unused bindings and the one graf module that pulls them (never imported here).
@@ -121,6 +138,7 @@ $piArgs = @(
     # (e.g. icons\tab_close.png) if you add them later. (; is the Windows sep.)
     '--add-data', 'src\graf_explorer\icons;icons'
 )
+foreach ($p in $PkgPaths) { $piArgs += @('--paths', $p) }
 if ($OneFile) { $piArgs += '--onefile' }
 $piArgs += $Entry
 

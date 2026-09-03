@@ -1,10 +1,26 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# NOTE: build_win.ps1 does NOT use this file -- it drives PyInstaller from the
+# command line and regenerates this spec as a side effect. Edits here survive
+# only until the next build_win.ps1 run; change build_win.ps1 too.
+import sys
+
 from PyInstaller.utils.hooks import collect_submodules
 from PyInstaller.utils.hooks import collect_all
 
+# build_support lives next to this spec; specs do not run with SPECPATH on sys.path.
+sys.path.insert(0, SPECPATH)
+from build_support import EXTRA_HIDDEN_IMPORTS, package_paths
+
+# graf and stardust are editable installs that PyInstaller's static analysis can
+# fail to locate, which silently drops *their* dependencies (e.g. cryptography,
+# pulled in only by stardust.io) from the bundle -- the frozen app then dies on
+# launch with a bare ModuleNotFoundError. See build_support.py.
+PATHEX = package_paths()
+
 datas = [('src/graf_explorer/icons', 'icons')]
 binaries = []
-hiddenimports = ['PyQt5.sip']
+hiddenimports = ['PyQt5.sip'] + list(EXTRA_HIDDEN_IMPORTS)
 hiddenimports += collect_submodules('pylogfile')
 hiddenimports += collect_submodules('colorama')
 tmp_ret = collect_all('graf')
@@ -21,7 +37,7 @@ EXCLUDES = ['PyQt6', 'PySide6', 'PySide2', 'graf.widgets']
 
 a = Analysis(
     ['src\\graf_explorer\\__main__.py'],
-    pathex=[],
+    pathex=PATHEX,
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

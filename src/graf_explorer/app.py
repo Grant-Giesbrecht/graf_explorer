@@ -58,8 +58,9 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QTableView, QTreeWidget,
     QTreeWidgetItem, QFileDialog, QMessageBox, QStyleFactory, QHeaderView,
     QPushButton, QAbstractItemView, QActionGroup, QCheckBox, QSizePolicy,
+    QStyledItemDelegate,
     QLineEdit, QSpinBox, QGridLayout, QFormLayout,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QDialog,
 )
 
 # Optional analysis dependencies — the app still runs without them, the relevant
@@ -75,6 +76,13 @@ try:
 except Exception:
     _scipy_curve_fit = None
     _scipy_windows = None
+
+# Trace formatting dialog (line / marker / error-bar styling + colour picker).
+try:
+    from graf_explorer.style_dialog import (TraceStyleDialog, apply_themed_icon,
+                                            set_icon_tint)
+except ImportError:                 # running app.py directly out of src/
+    from style_dialog import TraceStyleDialog, apply_themed_icon, set_icon_tint
 
 # ── GrAF stack ────────────────────────────────────────────────────────────────
 from graf.base import Graf
@@ -321,6 +329,58 @@ QPushButton#lockButton {{
     text-align: left;
 }}
 QPushButton#lockButton:hover {{ background-color: {t.accent}; color: #ffffff; }}
+
+/* Square icon buttons (colour picker, per-row format buttons) */
+QPushButton#iconButton {{
+    background-color: {t.header_bg};
+    color: {t.text};
+    border: 1px solid {t.border};
+    border-radius: 4px;
+    padding: 0px;
+    font-weight: normal;
+}}
+QPushButton#iconButton:hover {{ background-color: {t.accent}; color: #ffffff; }}
+
+QLineEdit, QAbstractSpinBox {{
+    background-color: {t.header_bg};
+    color: {t.text};
+    border: 1px solid {t.border};
+    border-radius: 4px;
+    padding: 4px 6px;
+    selection-background-color: {t.sel_bg};
+    selection-color: {t.sel_text};
+}}
+QLineEdit:read-only {{ color: {t.subtext}; }}
+QLineEdit:disabled, QAbstractSpinBox:disabled {{ color: {t.subtext}; }}
+
+QDialog {{ background-color: {t.bg}; }}
+QGroupBox {{
+    border: 1px solid {t.border};
+    border-radius: 5px;
+    margin-top: 12px;
+    padding-top: 6px;
+}}
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+    color: {t.accent};
+    font-weight: bold;
+}}
+
+QSlider::groove:horizontal {{
+    height: 5px;
+    background: {t.border};
+    border-radius: 3px;
+}}
+QSlider::sub-page:horizontal {{ background: {t.accent}; border-radius: 3px; }}
+QSlider::handle:horizontal {{
+    background: {t.text};
+    width: 12px;
+    margin: -5px 0;
+    border-radius: 6px;
+}}
+QSlider::handle:horizontal:hover {{ background: {t.accent_hover}; }}
 
 QToolBar {{ background-color: {t.surface}; border: none; spacing: 2px; }}
 
@@ -624,16 +684,50 @@ def _axis_label(ax, key):
     return ""
 
 
-def overlay_traces_from_packet(packet, fname):
+def unique_file_labels(paths):
+    """Short display labels for the open files that stay distinct when two of
+    them share a basename: only the colliding names grow parent directories,
+    and identical paths (the same file opened twice) are numbered."""
+    paths = [Path(p) for p in paths]
+    labels = [p.name for p in paths]
+    depth = 1
+    while True:
+        groups = {}
+        for i, lab in enumerate(labels):
+            groups.setdefault(lab, []).append(i)
+        clashes = [idxs for idxs in groups.values() if len(idxs) > 1]
+        if not clashes:
+            break
+        depth += 1
+        grew = False
+        for idxs in clashes:
+            for i in idxs:
+                parts = paths[i].parts
+                if depth <= len(parts):
+                    labels[i] = os.path.join(*parts[-depth:])
+                    grew = True
+        if not grew:                  # paths exhausted: they are the same file
+            for idxs in clashes:
+                for n, i in enumerate(idxs, 1):
+                    labels[i] = f"{labels[i]} ({n})"
+            break
+    return labels
+
+
+def overlay_traces_from_packet(packet, fname, uid=None):
     """Flatten a file's traces for the comparison view, keeping each trace's
     parent-axis X/Y labels and its own formatting (so the overlay can either
-    reuse the source format or fall back to defaults)."""
+    reuse the source format or fall back to defaults).
+
+    `uid` identifies the source tab; it -- not the file name -- is the trace's
+    identity, so files that share a basename never collide."""
     out = []
     for ax_key, ax in (packet.get("axes", {}) or {}).items():
         xlabel = _axis_label(ax, "x_axis")
         ylabel = _axis_label(ax, "y_axis_L")
         for tr_key, tr in (ax.get("traces", {}) or {}).items():
             out.append({
+                "uid": uid,
                 "file": fname,
                 "axis": ax_key,
                 "trace": tr_key,
@@ -648,6 +742,14 @@ def overlay_traces_from_packet(packet, fname):
                 "marker_size": tr.get("marker_size"),
                 "line_width": tr.get("line_width"),
                 "alpha": tr.get("alpha"),
+                "marker_color": tr.get("marker_color"),
+                "has_error_bars": bool(tr.get("has_error_bars")),
+                "err_line_color": tr.get("err_line_color"),
+                "err_line_width": tr.get("err_line_width"),
+                "err_cap_size": tr.get("err_cap_size"),
+                "err_cap_color": tr.get("err_cap_color"),
+                "err_cap_width": tr.get("err_cap_width"),
+                "err_cap_visible": tr.get("err_cap_visible"),
             })
     return out
 
@@ -668,6 +770,14 @@ def overlay_plot_kwargs(tr):
     mt = tr.get("marker_type")
     if mt and mt != "None":
         kw["marker"] = "s" if mt == "[]" else mt
+        mc = tr.get("marker_color")
+        if mc is not None:
+            try:
+                mc = tuple(float(c) for c in mc)
+                kw["markerfacecolor"] = mc
+                kw["markeredgecolor"] = mc
+            except Exception:
+                pass
     for src, dst in (("line_width", "linewidth"), ("alpha", "alpha"),
                      ("marker_size", "markersize")):
         v = tr.get(src)
@@ -1012,6 +1122,7 @@ class FileTab(QWidget):
         super().__init__(parent)
         FileTab._n_created += 1
         self._fig_id = FileTab._n_created
+        self.uid = self._fig_id           # stable identity for comparison tabs
         self._render_seq = 0
 
         self.graf = graf
@@ -1107,13 +1218,71 @@ class FileTab(QWidget):
         self.revert_btn.setFixedHeight(28)
         self.revert_btn.clicked.connect(self.revert)
 
+        self.format_btn = QPushButton("Format…")
+        self.format_btn.setObjectName("miniButton")
+        self.format_btn.setFixedHeight(28)
+        self.format_btn.setToolTip("Edit line / marker / error-bar formatting "
+                                   "for every trace in this file")
+        self.format_btn.clicked.connect(self.open_format_dialog)
+
         h.addWidget(self.lock_btn)
         h.addSpacing(8)
         h.addWidget(self.undo_btn)
         h.addWidget(self.redo_btn)
         h.addWidget(self.revert_btn)
+        h.addSpacing(8)
+        h.addWidget(self.format_btn)
         h.addStretch(1)
         return bar
+
+    # -- trace formatting ------------------------------------------------------
+    def open_format_dialog(self):
+        """Tabbed format editor over every trace in this file."""
+        traces = [it for it in enumerate_data_items(self.packet)
+                  if it["kind"] == "trace"]
+        if not traces:
+            QMessageBox.information(self, "No traces",
+                                    f"{self.path.name} has no traces to format.")
+            return
+        entries = []
+        for it in traces:
+            label = f"{it['trace']}  {it['name']}".strip()
+            entries.append({"key": (it["axis"], it["trace"]),
+                            "label": label or it["trace"],
+                            "style": it["node"]})
+        # Edits apply live, but the whole dialog session is one undo step.
+        state = {"snapped": False, "was_modified": self.modified}
+
+        def apply(styles):
+            if not state["snapped"]:
+                self._snapshot()
+                state["snapped"] = True
+            self._apply_trace_styles(styles)
+
+        dlg = TraceStyleDialog(entries, self, on_apply=apply,
+                               title=f"Trace formatting — {self.path.name}")
+        if dlg.exec_() != QDialog.Accepted and state["snapped"]:
+            # Cancel already restored the original formatting; drop the undo
+            # entry and the modified flag it earned along the way.
+            if self._undo_stack:
+                self._undo_stack.pop()
+            self.modified = state["was_modified"]
+            self.modifiedChanged.emit()
+            self.struct_status.setText("Formatting unchanged")
+
+    def _apply_trace_styles(self, styles):
+        """Write {(axis, trace): style dict} into the packet and re-render."""
+        axes = self.packet.get("axes", {}) or {}
+        applied = 0
+        for (ax_key, tr_key), style in styles.items():
+            tr = (axes.get(ax_key, {}) or {}).get("traces", {}).get(tr_key)
+            if tr is None:
+                continue
+            tr.update(copy.deepcopy(style))
+            applied += 1
+        self._reload_views()
+        self._mark_modified()
+        self.struct_status.setText(f"Applied formatting to {applied} trace(s)")
 
     # -- left: embedded matplotlib (rebuilt on every render) -------------------
     def _build_plot_panel(self):
@@ -2578,6 +2747,24 @@ class FileTab(QWidget):
 
 
 # ── Comparison / overlay tab ────────────────────────────────────────────────────
+LEGEND_COL = 2                       # tree column holding the legend entry text
+STYLE_COL = 3                        # column holding the per-trace format button
+
+
+class _LegendColumnDelegate(QStyledItemDelegate):
+    """Allows in-place editing in one column only (the legend entry), and only
+    on trace rows -- the checkbox columns keep their normal click behaviour."""
+
+    def __init__(self, column, parent=None):
+        super().__init__(parent)
+        self._column = column
+
+    def createEditor(self, parent, option, index):
+        if index.column() != self._column or not index.parent().isValid():
+            return None
+        return super().createEditor(parent, option, index)
+
+
 class OverlayTab(QWidget):
     """Overlay selected traces from any number of open files on one plot.
 
@@ -2590,8 +2777,10 @@ class OverlayTab(QWidget):
         self.host = host                  # GrafExplorer (enumerates open files)
         self.fig = None
         self.canvas = None
-        self._checked = set()             # {(file, axis, trace)} kept across refresh
-        self._bring_format = set()        # {(file, axis, trace)} → use source format
+        self._checked = set()             # {(uid, axis, trace)} kept across refresh
+        self._bring_format = set()        # {(uid, axis, trace)} → use source format
+        self._labels = {}                 # {(uid, axis, trace): custom legend text}
+        self._styles = {}                 # {(uid, axis, trace): format overrides}
         self._seq = 0
         self._replot_timer = QTimer(self)
         self._replot_timer.setSingleShot(True)
@@ -2618,20 +2807,31 @@ class OverlayTab(QWidget):
         cl.addWidget(hdr)
 
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["File / trace", "Fmt"])
+        self.tree.setHeaderLabels(["File / trace", "Fmt", "Legend entry", ""])
         self.tree.setRootIsDecorated(True)
         self.tree.setColumnWidth(0, 240)
         self.tree.header().setStretchLastSection(False)
         try:
             self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
             self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            self.tree.header().setSectionResizeMode(2, QHeaderView.Stretch)
+            self.tree.header().setSectionResizeMode(3, QHeaderView.Fixed)
+            self.tree.setColumnWidth(3, 34)
         except Exception:
             pass
+        # Only the legend column is editable; a delegate refuses an editor
+        # elsewhere so the checkbox columns keep their normal click behaviour.
+        self.tree.setItemDelegate(_LegendColumnDelegate(LEGEND_COL, self.tree))
+        self.tree.setEditTriggers(QAbstractItemView.DoubleClicked
+                                  | QAbstractItemView.SelectedClicked
+                                  | QAbstractItemView.EditKeyPressed)
         self.tree.itemChanged.connect(self._on_item_changed)
         cl.addWidget(self.tree, 1)
 
         hint = QLabel("First box shows the trace · “Fmt” keeps its own colour/style "
-                      "(off ⇒ default formatting).")
+                      "(off ⇒ default formatting) · double-click a “Legend entry” "
+                      "to rename it (blank ⇒ automatic) · the last column's "
+                      "button edits that trace's line / marker formatting.")
         hint.setObjectName("welcomeHint"); hint.setWordWrap(True)
         cl.addWidget(hint)
 
@@ -2639,15 +2839,42 @@ class OverlayTab(QWidget):
         self.legend_cb.toggled.connect(self._replot)
         self.grid_cb = QCheckBox("Grid"); self.grid_cb.setChecked(True)
         self.grid_cb.toggled.connect(self._replot)
+        self.prefix_cb = QCheckBox("Prefix file name in automatic legend entries")
+        self.prefix_cb.setChecked(True)
+        self.prefix_cb.setToolTip("Automatic entries read “file · trace”; "
+                                  "uncheck for the trace name alone. "
+                                  "Renamed entries are left alone.")
+        self.prefix_cb.toggled.connect(self._on_prefix_toggled)
         cl.addWidget(self.legend_cb)
         cl.addWidget(self.grid_cb)
+        cl.addWidget(self.prefix_cb)
+
+        legrow = QHBoxLayout(); legrow.setContentsMargins(0, 0, 0, 0)
+        legrow.addWidget(QLabel("Legend position"))
+        self.legend_loc = QComboBox()
+        for loc in ("best", "upper right", "upper left", "lower left",
+                    "lower right", "center right", "center left",
+                    "upper center", "lower center"):
+            self.legend_loc.addItem(loc)
+        self.legend_loc.currentIndexChanged.connect(self._replot)
+        legrow.addWidget(self.legend_loc, 1)
+        cl.addLayout(legrow)
 
         btns = QHBoxLayout(); btns.setContentsMargins(0, 0, 0, 0)
         refresh = QPushButton("Refresh files"); refresh.setObjectName("miniButton")
         refresh.clicked.connect(self.refresh)
         clear = QPushButton("Uncheck all"); clear.setObjectName("miniButton")
         clear.clicked.connect(self._uncheck_all)
-        btns.addWidget(refresh); btns.addWidget(clear); btns.addStretch(1)
+        reset = QPushButton("Reset legends"); reset.setObjectName("miniButton")
+        reset.setToolTip("Drop every renamed legend entry and go back to the "
+                         "automatic labels")
+        reset.clicked.connect(self._reset_legends)
+        reset_fmt = QPushButton("Reset formats"); reset_fmt.setObjectName("miniButton")
+        reset_fmt.setToolTip("Drop every per-trace formatting override set here")
+        reset_fmt.clicked.connect(self._reset_styles)
+        btns.addWidget(refresh); btns.addWidget(clear); btns.addWidget(reset)
+        btns.addWidget(reset_fmt)
+        btns.addStretch(1)
         cl.addLayout(btns)
 
         self.make_btn = QPushButton("Make GrAF…"); self.make_btn.setObjectName("miniButton")
@@ -2665,29 +2892,130 @@ class OverlayTab(QWidget):
         self.split = split
         outer.addWidget(split, 1)
 
+    @staticmethod
+    def _key(tr):
+        """Identity of one overlay trace. Keyed on the source tab's uid rather
+        than its file name, so two open files sharing a basename stay distinct."""
+        return (tr.get("uid"), tr["axis"], tr["trace"])
+
+    def _auto_label(self, tr):
+        """The legend entry used when the user has not renamed this trace."""
+        name = tr["name"] or tr["trace"]
+        if self.prefix_cb.isChecked() and tr.get("file"):
+            return f"{tr['file']} · {name}"
+        return name
+
+    def _label_for(self, tr):
+        """The legend entry actually drawn: the user's text, else automatic."""
+        custom = self._labels.get(self._key(tr), "")
+        return custom if custom else self._auto_label(tr)
+
     def refresh(self, *args):
         """Rescan open files; rebuild the tree, preserving checked traces."""
         self.tree.blockSignals(True)
         self.tree.clear()
         files = self.host.file_tabs()
-        for tab in files:
-            fname = tab.path.name
+        names = unique_file_labels([tab.path for tab in files])
+        for tab, fname in zip(files, names):
             fitem = QTreeWidgetItem(self.tree, [fname])
             fitem.setFlags(fitem.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsAutoTristate)
+            fitem.setToolTip(0, str(tab.path))
             fitem.setExpanded(True)
-            for tr in overlay_traces_from_packet(tab.packet, fname):
+            for tr in overlay_traces_from_packet(tab.packet, fname, uid=tab.uid):
                 label = f"{tr['trace']}   {tr['name']}".strip()
-                citem = QTreeWidgetItem(fitem, [label, ""])
-                citem.setFlags(citem.flags() | Qt.ItemIsUserCheckable)
+                key = self._key(tr)
+                citem = QTreeWidgetItem(fitem, [label, "", self._label_for(tr)])
+                citem.setFlags(citem.flags() | Qt.ItemIsUserCheckable
+                               | Qt.ItemIsEditable)
                 citem.setData(0, Qt.UserRole, tr)
-                key = (fname, tr["axis"], tr["trace"])
                 citem.setCheckState(0, Qt.Checked if key in self._checked else Qt.Unchecked)
                 citem.setCheckState(1, Qt.Checked if key in self._bring_format else Qt.Unchecked)
                 citem.setToolTip(1, "Keep this trace's own colour / line style")
+                citem.setToolTip(LEGEND_COL, "Double-click to rename this legend "
+                                             "entry (clear it for the automatic one)")
+                btn = QPushButton()
+                btn.setObjectName("iconButton")
+                btn.setFixedSize(28, 20)
+                apply_themed_icon(btn, "format.png", size=13)
+                btn.setToolTip("Edit this trace's line / marker formatting")
+                btn.clicked.connect(lambda _=False, t=tr: self._open_style_dialog(t))
+                self.tree.setItemWidget(citem, STYLE_COL, btn)
         self.tree.blockSignals(False)
         if not files:
             self.status.setText("No files open. Open a .graf file, then Refresh.")
         self._replot()
+
+    def _trace_index(self, tr):
+        """Position of a trace among the checked ones (drives the default
+        colour, so a trace keeps the colour it has in the plot)."""
+        key = self._key(tr)
+        for i, e in enumerate(self._iter_checked()):
+            if self._key(e) == key:
+                return i
+        return 0
+
+    def _effective_style(self, tr):
+        """The formatting currently drawn for a trace: an explicit override if
+        one was set here, else its source format, else the overlay default."""
+        key = self._key(tr)
+        if key in self._styles:
+            style = dict(self._styles[key])
+        elif key in self._bring_format:
+            style = {k: tr.get(k) for k in
+                     ("line_color", "line_type", "line_width", "marker_type",
+                      "marker_size", "alpha") if tr.get(k) is not None}
+            style.setdefault("marker_color", style.get("line_color"))
+        else:
+            style = {}
+            cycle = default_color_cycle()
+            apply_default_trace_format(style, cycle[self._trace_index(tr) % len(cycle)])
+            style["line_width"] = 1.3
+        style["has_error_bars"] = bool(tr.get("has_error_bars"))
+        for k in ("err_line_color", "err_line_width", "err_cap_size",
+                  "err_cap_color", "err_cap_width", "err_cap_visible"):
+            if k not in style and tr.get(k) is not None:
+                style[k] = tr[k]
+        return style
+
+    def _open_style_dialog(self, tr):
+        """Per-trace format editor, opened from the button on its row."""
+        key = self._key(tr)
+        entry = {"key": key,
+                 "label": self._label_for(tr),
+                 "style": self._effective_style(tr)}
+
+        had_override = key in self._styles
+        previous = dict(self._styles[key]) if had_override else None
+
+        def apply(styles):
+            self._styles[key] = dict(styles[key])
+            self._do_replot()
+
+        dlg = TraceStyleDialog([entry], self, on_apply=apply,
+                               title=f"Format — {self._label_for(tr)}")
+        if dlg.exec_() != QDialog.Accepted:
+            if had_override:
+                self._styles[key] = previous
+            else:
+                self._styles.pop(key, None)    # back to Fmt / default formatting
+            self._do_replot()
+
+    def _reset_styles(self):
+        self._styles.clear()
+        self._replot()
+
+    def _refresh_legend_column(self):
+        """Re-render the Legend entry cells without rebuilding the tree."""
+        self.tree.blockSignals(True)
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            fitem = root.child(i)
+            for j in range(fitem.childCount()):
+                citem = fitem.child(j)
+                tr = citem.data(0, Qt.UserRole)
+                if tr is not None:
+                    citem.setText(LEGEND_COL, self._label_for(tr))
+        self.tree.blockSignals(False)
 
     def _iter_checked(self):
         out = []
@@ -2705,7 +3033,7 @@ class OverlayTab(QWidget):
     def _on_item_changed(self, item, col):
         tr = item.data(0, Qt.UserRole)
         if tr is not None:                # leaf (trace) item
-            key = (tr["file"], tr["axis"], tr["trace"])
+            key = self._key(tr)
             if col == 0:
                 if item.checkState(0) == Qt.Checked:
                     self._checked.add(key)
@@ -2716,6 +3044,28 @@ class OverlayTab(QWidget):
                     self._bring_format.add(key)
                 else:
                     self._bring_format.discard(key)
+            elif col == LEGEND_COL:
+                text = item.text(LEGEND_COL).strip()
+                if not text or text == self._auto_label(tr):
+                    self._labels.pop(key, None)
+                else:
+                    self._labels[key] = text
+                # Put the effective label back in the cell (an emptied cell
+                # shows the automatic entry again).
+                shown = self._label_for(tr)
+                if item.text(LEGEND_COL) != shown:
+                    self.tree.blockSignals(True)
+                    item.setText(LEGEND_COL, shown)
+                    self.tree.blockSignals(False)
+        self._replot()
+
+    def _on_prefix_toggled(self, *args):
+        self._refresh_legend_column()
+        self._replot()
+
+    def _reset_legends(self):
+        self._labels.clear()
+        self._refresh_legend_column()
         self._replot()
 
     def _uncheck_all(self):
@@ -2740,9 +3090,14 @@ class OverlayTab(QWidget):
             m = min(len(x), len(y))
             if m == 0:
                 continue
-            key = (tr["file"], tr["axis"], tr["trace"])
-            kw = overlay_plot_kwargs(tr) if key in self._bring_format else {"linewidth": 1.3}
-            label = f"{tr['file']} · {tr['name'] or tr['trace']}"
+            key = self._key(tr)
+            if key in self._styles:
+                kw = overlay_plot_kwargs(self._styles[key])
+            elif key in self._bring_format:
+                kw = overlay_plot_kwargs(tr)
+            else:
+                kw = {"linewidth": 1.3}
+            label = self._label_for(tr)
             try:
                 ax.plot(x[:m], y[:m], label=label, **kw)
             except Exception:
@@ -2759,7 +3114,8 @@ class OverlayTab(QWidget):
         if self.legend_cb.isChecked():
             handles, labels = ax.get_legend_handles_labels()
             if labels:
-                ax.legend(handles, labels, loc="best", fontsize="small")
+                ax.legend(handles, labels, loc=self.legend_loc.currentText(),
+                          fontsize="small")
         try:
             fig.tight_layout()
         except Exception:
@@ -2803,7 +3159,7 @@ class OverlayTab(QWidget):
     def _build_comparison_packet(self, sel):
         """Use the first selected trace's source file as a structural template,
         reduce it to one axis, and fill it with the selected traces."""
-        template_tab = self.host.find_file_tab(sel[0]["file"])
+        template_tab = self.host.find_file_tab_by_uid(sel[0].get("uid"))
         if template_tab is None:
             raise RuntimeError("source file is no longer open")
         base = copy.deepcopy(template_tab.packet)
@@ -2821,7 +3177,7 @@ class OverlayTab(QWidget):
 
         cycle = default_color_cycle()
         for i, entry in enumerate(sel):
-            src_tab = self.host.find_file_tab(entry["file"])
+            src_tab = self.host.find_file_tab_by_uid(entry.get("uid"))
             if src_tab is None:
                 continue
             try:
@@ -2829,10 +3185,12 @@ class OverlayTab(QWidget):
             except (KeyError, TypeError):
                 continue
             tr = copy.deepcopy(src)
-            key = (entry["file"], entry["axis"], entry["trace"])
-            if key not in self._bring_format:
+            key = self._key(entry)
+            if key not in self._bring_format and key not in self._styles:
                 apply_default_trace_format(tr, cycle[i % len(cycle)])
-            tr["display_name"] = f"{entry['file']} · {entry['name'] or entry['trace']}"
+            if key in self._styles:
+                tr.update(copy.deepcopy(self._styles[key]))
+            tr["display_name"] = self._label_for(entry)
             tr["include_in_legend"] = True
             tr["use_yaxis_R"] = False         # everything shares the left axis
             axis["traces"][f"Tr{i}"] = tr
@@ -3102,6 +3460,7 @@ class GrafExplorer(QMainWindow):
     # -- theme -----------------------------------------------------------------
     def _apply_theme(self):
         QApplication.instance().setStyleSheet(build_stylesheet(self.theme))
+        set_icon_tint(self.theme.text)       # re-tint themed button glyphs
         if hasattr(self, "tabs"):
             for i in range(self.tabs.count()):
                 w = self.tabs.widget(i)
@@ -3200,10 +3559,10 @@ class GrafExplorer(QMainWindow):
         return [self.tabs.widget(i) for i in range(self.tabs.count())
                 if isinstance(self.tabs.widget(i), FileTab)]
 
-    def find_file_tab(self, name):
-        """First open FileTab whose file name matches (used by Make GrAF)."""
+    def find_file_tab_by_uid(self, uid):
+        """The open FileTab with this uid, or None if it has been closed."""
         for tab in self.file_tabs():
-            if tab.path.name == name:
+            if getattr(tab, "uid", None) == uid:
                 return tab
         return None
 
