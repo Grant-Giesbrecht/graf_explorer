@@ -514,7 +514,7 @@ class ColorField(QWidget):
         self.btn = QPushButton()
         self.btn.setObjectName("iconButton")
         self.btn.setFixedSize(30, 24)
-        apply_themed_icon(self.btn, "format.png", size=15)
+        apply_themed_icon(self.btn, "color.png", size=15)
         self.btn.setToolTip("Open the colour picker")
         self.btn.clicked.connect(self._open_picker)
         h.addWidget(self.swatch)

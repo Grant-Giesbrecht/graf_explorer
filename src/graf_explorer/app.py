@@ -1221,6 +1221,7 @@ class FileTab(QWidget):
         self.format_btn = QPushButton("Format…")
         self.format_btn.setObjectName("miniButton")
         self.format_btn.setFixedHeight(28)
+        apply_themed_icon(self.format_btn, "format.png", size=15)
         self.format_btn.setToolTip("Edit line / marker / error-bar formatting "
                                    "for every trace in this file")
         self.format_btn.clicked.connect(self.open_format_dialog)
